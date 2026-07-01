@@ -395,3 +395,230 @@ IS linked. Still structural-only verification (no live ComfyUI run this session)
   compute centered pads = (target-source); ImagePadForOutpaint pads to exactly target; Flux Fill
   generates the border; crop→1080. Source expected SMALLER than target. Now 22 nodes, no stretch.
 - Crop-to-1080 kept on all 4 (user confirmed).
+
+### UPDATED (2026-07-01, per user): Ideogram-Image-Gen-1080p is now a native subgraph
+User asked: make ImageGen a subgraph, everything inside, only 4 exposed control groups:
+(1) pos+neg prompt, (2) optional image seed + its toggle, (3) width/height, (4) save
+(filename) + preview. Then confirmed: "everything else should be inside the subgraph".
+
+Implementation: added `emit_single_subgraph()`/`dump_subgraph()` to
+`generator/build_extracted_workflows.py` — a simplified, purpose-built version of the
+proven `emit_subgraphs()` mechanism from `build_workflow.py` (same schema: instance
+`type`=def UUID, `properties.proxyWidgets` list, def `links` as named-object dicts),
+but for exactly ONE self-contained box with **zero exposed wire sockets** — nothing
+needs to route further, so no `-10`/`-20` boundary inputs/outputs at all. All 26 nodes
+(loaders, CLIPTextEncode pos/neg, guider chain, latent, ref-image+toggle+switch,
+schedulers, sampler, decode, 1080p crop, SaveImage, PreviewImage) now live inside;
+outward-facing widget list (in this exact order, giving 4 visual groups):
+positive prompt, negative prompt, image seed, use-image-seed toggle, target width,
+target height, save filename. Registered `WIDGET_KEY["SaveImage"]="filename_prefix"`
+(mutated the shared dict from build_workflow.py — first time a Save node's filename is
+proxied outward). Reused `lint_subgraph()` from build_workflow.py unchanged — passes.
+
+Deliberately did NOT replicate the original 3-meta pipeline's odd pattern of giving
+PreviewImage a fake `outputs` list (used there to chain across subgraph boundaries) —
+here PreviewImage is a true terminal leaf like real ComfyUI (no outputs), since nothing
+downstream needs its image.
+
+Flux-Inpaint/Outpaint/Video workflows are UNCHANGED (still flat) — user scoped this ask
+to ImageGen only.
+
+Known limitation carried over unchanged: `Ideogram4Scheduler` width/height widgets are
+still static (1920/1088), not linked to the target width/height primitives.
+
+Still structural-only verification (schema lint + JSON validity) — not yet loaded in a
+live ComfyUI frontend this session.
+
+### UPDATED (2026-07-01): user reported RobertaProcessing error on Flux-Inpaint (DualCLIPLoader)
+Diagnosed: NOT a workflow bug. `transformers`' CLIP tokenizer init calls
+`processors.RobertaProcessing(sep=..., cls=...)` as keyword args; installed `tokenizers`
+build on the user's ComfyUI server no longer accepts `cls` as a kwarg -> version mismatch
+between `transformers`/`tokenizers` in `/projects/comfyui/.venv`. Same root cause would hit
+ANY workflow using DualCLIPLoader+clip_l (inpaint, outpaint, original pipeline's Inpaint
+stage) — not introduced by our generator. No local fix possible (remote server, no shell
+access); told user to align versions there (`pip install -U transformers`, or pin
+`tokenizers` to match).
+
+### DONE (2026-07-01): Flux-Inpaint and Flux-Outpaint converted to native subgraphs too
+User: "do inpaint and outpaint like imagegen subgraphs, keep prompts and optional image
+seed and resolution outside unify into single node what makes sense". Applied the same
+`emit_single_subgraph()` pattern as ImageGen (one collapsed box, zero exposed wire
+sockets, all internals hidden). Grouping differs slightly from ImageGen's 4 groups since
+inpaint/outpaint's image is MANDATORY (the thing being edited), not optional/toggleable
+like image-gen's style reference — so 3 groups instead of 4:
+- (positive prompt, negative prompt)
+- (image seed) — LoadImage.image, no ON/OFF toggle
+- (target width, target height, save filename)
+Both also gained an internal PreviewImage (fed by the same 1080p-cropped output as
+SaveImage) for parity with ImageGen — previously missing from these two.
+`flux_fill_body()` now returns `(dec, pos, neg)` instead of just `dec` so callers can
+proxy the prompt nodes. Both regenerate clean (`subgraph lint OK`), JSON valid.
+Outpaint's auto-computed pad amounts (GetImageSize + centered math, no manual pad
+primitives) are unaffected, fully hidden inside the box now.
+
+### DONE (2026-07-01): README synced with subgraph conversion
+`README.md`'s "Extracted standalone workflows" section was stale (still said all 4 are
+flat, described old toggle-gated image-seed wording for inpaint/outpaint). Updated: table
+now shows per-file exposed control groups matching the actual proxyWidgets, notes the
+3-of-4 subgraph packaging + internal PreviewImage, and documents the RobertaProcessing/
+transformers-tokenizers environment gotcha for the Flux-based workflows.
+
+### FIXED (2026-07-01): mask editor invisible for already-uploaded images (Inpaint/Outpaint)
+User: "I can't see the mask editor if I choose an image from the drop-down that I already
+uploaded. I can, however, if I upload a new image." Root cause diagnosed: `proxyWidgets`
+only mirrors a LoadImage node's plain filename-combo onto the collapsed subgraph box — it
+does NOT carry over the frontend's preview-thumbnail + right-click "Open in MaskEditor"
+wiring that's attached to a real LoadImage node instance. Fresh upload works because the
+upload flow sets the preview directly; picking an existing file from the mirrored combo
+never populates a preview, so there's nothing to right-click.
+
+Fix: added `emit_subgraph_with_image_seed()` to the generator — like
+`emit_single_subgraph()` but keeps the LoadImage node as a REAL, un-proxied top-level node
+sitting next to the collapsed box, wired in via a genuine exposed subgraph input socket
+(not a widget proxy). Applied to both Flux-Inpaint-1080p (2 sockets: IMAGE, MASK) and
+Flux-Outpaint-1080p (1 IMAGE socket fanning to both GetImageSize.image and
+ImagePadForOutpaint.image internally — confirmed via source-keyed exposure, matching the
+subgraph schema's documented fan-out support). Both files now have 2 top-level nodes
+(external LoadImage + collapsed box) instead of 1. Proxied groups shrank from
+(pos,neg,image,width,height,save) to (pos,neg,width,height,save) since image moved out.
+Regenerated, `subgraph lint OK` for both, JSON valid.
+
+Deliberately did NOT touch Ideogram-Image-Gen-1080p's optional reference image (same
+proxy mechanism, likely same latent bug) — not reported, toggle-gated/less central; left
+as-is and flagged to user rather than expanding scope unasked.
+
+### OPEN: second reported error has no content
+User's message referenced "the following error" twice with no actual error text/report
+attached (likely a paste mishap) — asked them to repaste it, since it can't be diagnosed
+blind. Not yet resolved, pending user follow-up.
+
+### CONFIRMED (2026-07-01): mask-editor fix works in live ComfyUI
+User tested Flux-Inpaint-1080p with the external-LoadImage fix (emit_subgraph_with_image_seed).
+Screenshot confirms: external LoadImage shows a real thumbnail (1023x1537), mask painting
+works, output filename is a real clipspace-painted-masked-*.png -- fix verified working,
+not just structurally-linted. First actual live-ComfyUI confirmation of any of this
+session's output.
+
+RobertaProcessing/transformers-tokenizers error still reproduces (same root cause as
+before, confirmed via a second full error report + attached workflow JSON matching our
+current external-LoadImage design exactly -- ruled out any relation to the subgraph
+restructuring). Gave more specific remediation steps this time (pip show, then try
+upgrading transformers, else downgrade tokenizers<0.20, else pin both explicitly) since
+the earlier simple suggestion apparently wasn't enough / wasn't applied yet. Still no
+shell access to the user's remote ComfyUI server to fix directly.
+
+Noted (not actionable): logs also contained one stale validation error from an
+intermediate test state ("LoadImage 9001:7 VALIDATE_INPUTS() missing image") that doesn't
+match the currently attached workflow -- ignored as leftover from before the external-node
+fix was applied.
+
+### FIXED (2026-07-02): Flux-Inpaint not respecting "keep shape, just recolor" prompts
+User: prompted "make his turban in yellow, do NOT change his turban's outlook, just the
+color" -- got a recolored turban with a DIFFERENT shape (soft draped cloth -> structured
+rounded Sikh-style). Root cause: `flux_fill_body()`'s KSampler was hardcoded to
+denoise=1.0, meaning the masked region is pure noise going into the sampler -- the model
+has zero anchor on the original silhouette under the mask and freely invents a new one
+guided only by the prompt + surrounding pixels. Secondary factor (prompting technique, not
+a workflow bug): diffusion text encoders don't reliably respect negation ("do NOT
+change X") the way an LLM would; positive phrasing describing the desired end state
+works much better.
+
+Fix (user chose "expose as tunable" over other options): `flux_fill_body()` now takes a
+`denoise` param (default 1.0, unchanged) and returns the KSampler node too. Registered
+`WIDGET_KEY["KSampler"]="denoise"`. Flux-Inpaint calls it with `denoise=0.65` and proxies
+the KSampler onto the collapsed box (4th group, between prompts and resolution) so it's
+adjustable per-edit without opening the JSON. Flux-Outpaint deliberately keeps
+denoise=1.0 UNEXPOSED -- the padded border has no original content to preserve, so full
+regen is correct there, not a bug to fix. Regenerated, `subgraph lint OK`, JSON valid,
+confirmed `denoise=0.65` present in Inpaint's KSampler widgets_values and `1.0` unchanged
+in Outpaint's.
+
+### FIXED (2026-07-02): Flux-Outpaint crash on portrait source into landscape target
+User hit: `RuntimeError: expanded size (225) must match existing size (1537)` in
+ImagePadForOutpaint, source image 1023x1537 (portrait) into 1920x1088 (landscape) target.
+Root cause: outpaint's pad math assumed the source always fits within the target in BOTH
+dimensions (`pad = (target-source)/2`), but a portrait source into a landscape target
+(the classic outpaint case) has source_h(1537) > target_h(1088), making that formula go
+NEGATIVE -- ImagePadForOutpaint can only add border, not crop, and crashed.
+
+Fix: scale the source to fit inside the target bounds (preserving aspect, only shrinking,
+never upscaling) BEFORE padding. scale = min(1, target_w/src_w, target_h/src_h), via
+ComfyMathExpression -- confirmed `min`/`max`/`abs` are genuinely supported by fetching
+ComfyUI core's actual source (comfy_extras/nodes_math.py has
+`MATH_FUNCTIONS = {"min": min, "max": max, "abs": abs, ...}`), not guessed. Added
+ImageScaleBy (confirmed real core node via GitHub source: nodes.py, scale_by FLOAT input)
++ a second GetImageSize (post-scale) to get the actual scaled dims robustly rather than
+relying on our own rounding matching ImageScaleBy's internal round(). Pad amount
+expressions wrapped in max(0, ...) as a defensive clamp against any 1px rounding mismatch.
+
+Verified in Python (not just lint) against 5 cases incl. the user's exact failing
+dimensions: portrait-into-landscape (1023x1537->1920x1088, was the crash, now scale=0.708,
+pad L/R=598 T/B=0, canvas exactly 1920x1088), already-fits (800x600, scale=1 unchanged),
+exact-fit, both-dims-exceed, and extreme aspect (100x2000) -- all produce exactly the
+target canvas with zero negative pads. Regenerated, `subgraph lint OK`, JSON valid.
+
+### DONE (2026-07-02): LTX-2.3-Video-Gen-1080p converted to native subgraph
+User: "make the video generation workflow hiding all details in a subgraph, except
+prompts, images, duration, width/height and fps." Applied the same pattern as
+ImageGen/Inpaint/Outpaint, extended to support THREE external image seeds instead of one.
+
+Implementation:
+- Added `emit_subgraph_with_image_seeds()` (plural) to the generator -- generalizes
+  `emit_subgraph_with_image_seed()` to N external LoadImage nodes instead of 1. Exposure
+  keyed by (ext_node.id, ext_output_name) so 3 different LoadImage.IMAGE outputs get
+  distinct sockets (not collapsed onto one "IMAGE" socket by name collision). Kept the
+  singular function untouched (Inpaint/Outpaint already live-confirmed working -- no
+  reason to risk touching that code path).
+- `_guide_stage()` no longer G.links the keyframe image internally -- now returns
+  `{name: guide_node}` so the caller can wire each external LoadImage to both its stage1
+  AND stage2 LTXVAddGuide.image input (2 internal targets per keyframe, fan-out from one
+  external source, same mechanism proven for Outpaint's image->{GetImageSize,ImageScaleBy}).
+- `first_img`/`mid_img`/`last_img` now built in a SHARED throwaway `Graph()` (not three
+  separate ones) so they get unique sequential top-level ids 1,2,3 -- three separate
+  `Graph()` calls would each start at id=1 and collide once placed in the same top-level
+  `nodes` list.
+- `stage1 width/height` (previously 2 separate manually-tunable PrimitiveInt, `S1_W`/`S1_H`)
+  are now COMPUTED internally via `ComfyMathExpression("a//2")` from target width/height --
+  user only asked for ONE width/height pair exposed, and manual stage1=target/2 sync was a
+  latent footgun anyway (LTX needs mult-of-64 target -> mult-of-32 stage1, now automatic).
+
+Exposed on the collapsed box (9 widgets, in the user's requested order): positive prompt,
+negative prompt, use-first/mid/last-frame ON/OFF toggles (the "images" cluster --
+LoadImage nodes themselves are 3 real external nodes next to the box, not proxied, for
+mask-editor/preview reliability), duration (seconds), target width, target height, fps.
+
+Verified: 4 top-level nodes (3 external LoadImage ids 1/2/3 + 1 collapsed box id 9001, no
+id collisions), 67 internal nodes hidden, each keyframe's exposed IMAGE socket fans to
+exactly 2 internal linkIds (stage1+stage2 guide), stage1 w/h compute to 960/544 matching
+the original defaults exactly (1920//2, 1088//2). `subgraph lint OK`, JSON valid, no
+`"widget": null`.
+
+### DIAGNOSED + FIXED (2026-07-02): Outpaint produced 3 duplicated copies of the subject
+User's outpaint result (1023x1537 portrait -> 1920x1088 landscape, prompt "extend the
+garden"/"too much green") showed 3 near-identical copies of the person tiled across the
+canvas instead of new garden scenery. Verified via direct JSON inspection (not just lint)
+that the wiring is structurally correct: fit.scale_by IS fed by the scale ComfyMathExpression,
+pad.image IS fed by ImageScaleBy's output, pad's left/top/right/bottom ARE fed by the
+correct max(0,...) expressions -- no code bug.
+
+Diagnosis: portrait->landscape requires shrinking the source to 724 wide inside the 1920
+canvas, leaving ~62% of the final image as entirely new/generated content -- a large fill
+ratio for a single outpaint pass. Combined with a fairly generic prompt (doesn't say what
+should occupy the new space or discourage duplicate people), Flux Fill defaulted to a
+known outpainting failure mode: replicating the one high-confidence recognizable subject
+instead of inventing coherent new background. Not a workflow defect -- model/prompt
+behavior at a large fill ratio.
+
+Compounding factor found: KSampler's seed was FIXED (43, "fixed" mode) for both
+Inpaint and Outpaint, so identical inputs reproduce the exact same result (including any
+hallucination) every run, with no easy way to get a different attempt. User chose:
+randomize on Outpaint only (Inpaint stays fixed/reproducible -- useful once you've found
+a good edit there).
+
+Fix: `flux_fill_body()` now takes a `seed_control` param (default "fixed", preserves
+Inpaint's existing behavior unchanged); Outpaint's call site now passes
+`seed_control="randomize"`. Regenerated, confirmed via JSON inspection: Outpaint's
+KSampler widgets_values[1] == "randomize", Inpaint's == "fixed" (unchanged). Advised user
+to also make the prompt more explicit about desired background content and to expect
+some retries are normal for large-ratio outpaints -- this is inherent to how diffusion
+outpainting works, not something the workflow JSON alone can fully solve.
