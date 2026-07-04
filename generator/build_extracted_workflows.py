@@ -44,10 +44,58 @@ WIDGET_KEY["SaveImage"] = "filename_prefix"
 # strongly" (near 1.0, discards original masked content) vs "preserve original structure,
 # shift color/detail only" (lower values) -- see flux_fill_body()'s docstring.
 WIDGET_KEY["KSampler"] = "denoise"
+# Same reasoning: expose Video Gen's keyframe guide strength. LTXVAddGuide's strength
+# widget supports up to 10.0 (confirmed via core node schema, comfy_extras/nodes_lt.py),
+# not just 0-1 -- at LTX-2.3's distilled low-CFG sampling, strength is the SOLE mechanism
+# enforcing keyframe adherence, and the conservative <=1.0 defaults inherited from the
+# original pipeline weren't visibly "locking" the first/last frame at all (user-reported).
+WIDGET_KEY["LTXVAddGuide"] = "strength"
+# First-frame conditioning switched from LTXVAddGuide to LTXVImgToVideoConditionOnly --
+# matches the official Lightricks two-stage reference template exactly and avoids a known,
+# still-open bug specific to LTXVAddGuide with combined first+last frame_idx (GH
+# Comfy-Org/ComfyUI#12832, "last 1 second very bad" -- exact match for what we hit live).
+# Same reasoning as above: expose its own strength widget.
+WIDGET_KEY["LTXVImgToVideoConditionOnly"] = "strength"
+# Custom node (see generator/custom_nodes/ltx23_helpers) that bundles LoadImage + an
+# enable checkbox into ONE node, so each keyframe lane is a single input node. If it's
+# ever proxied, its exposeable widget is the enable checkbox.
+WIDGET_KEY["LoadImageWithEnable"] = "enable"
+# SDXL-Flux outpaint loaders -- exposed as pickers on the box so the user can select the
+# SDXL checkpoint / ControlNet Union promax / 4x upscale model they downloaded.
+WIDGET_KEY["CheckpointLoaderSimple"] = "ckpt_name"
+WIDGET_KEY["ControlNetLoader"] = "control_net_name"
+
+# Multi-GPU model residency (user has 4x A100 40GB, confirmed ComfyUI-MultiGPU
+# pollockjj/city96 lineage installed). Each workflow's loaders are pinned to a dedicated
+# GPU via that pack's *MultiGPU node variants (UNETLoaderMultiGPU, VAELoaderMultiGPU,
+# CLIPLoaderMultiGPU, DualCLIPLoaderMultiGPU, CheckpointLoaderSimpleMultiGPU -- confirmed
+# these exist via the pack's actual __init__.py/wrappers.py source, not guessed). This
+# does NOT make a single generation's internal steps run concurrently -- ComfyUI executes
+# one queued workflow's nodes sequentially regardless of device. What it DOES do: each
+# workflow's models stay resident on their OWN GPU instead of competing for space on one
+# shared default device, eliminating the repeated evict/reload swap cost, and letting
+# multiple DIFFERENT workflows (e.g. an Inpaint + an Outpaint job) run truly concurrently
+# without fighting over the same VRAM.
+GPU_IMAGEGEN = "cuda:0"
+GPU_INPAINT = "cuda:1"
+GPU_OUTPAINT = "cuda:2"
+GPU_VIDEO = "cuda:3"
 
 C_ID = CONFIG["ideogram"]
 C_FF = CONFIG["flux_fill"]
 C_LTX = CONFIG["ltx"]
+# SDXL+Flux multi-stage outpaint (see build_sdxl_flux_outpaint). The model filenames are
+# DEFAULTS -- the user must download them and may rename; both are exposed as tunable
+# pickers on the collapsed box. Canvas runs at the full 1920x1088 (cropped to 1080p out) --
+# NOT a smaller SDXL-friendly size -- because shrinking a high-res source down to ~576px
+# then upscaling produced weak, flat outpainted borders ("frame" artifact). Working at full
+# 1080p keeps the source at native detail and gives SDXL/Flux the resolution to extend well.
+C_SDXL = {
+    "checkpoint": "juggernautXL_v9.safetensors",          # any SDXL 1.0 checkpoint
+    "controlnet": "diffusion_pytorch_model_promax.safetensors",  # xinsir/ControlNet-Union-SDXL promax (v2)
+    "steps": 25, "cfg": 4.5, "sampler": "dpmpp_2m", "scheduler": "karras",
+    "grow_mask": 30,                                       # VAEEncodeForInpaint grow_mask_by (seam blend zone)
+}
 OUT_W, OUT_H = CONFIG["out_w"], CONFIG["out_h"]          # 1920, 1088 (generate res)
 S1_W, S1_H = CONFIG["stage1_w"], CONFIG["stage1_h"]      # 960, 544  (LTX stage-1 = out/2)
 SEED = CONFIG["seed"]
@@ -98,12 +146,22 @@ def res_primitives(G, x=-2200, y=0):
     return tw, th
 
 
-def flux_fill_loaders(G, x=-1500):
-    unet = G.node("UNETLoader", (x, 0), outputs=[("MODEL", "MODEL")],
-                  widgets=[C_FF["diffusion"], "fp8_e4m3fn"])
-    clip = G.node("DualCLIPLoader", (x, 180), outputs=[("CLIP", "CLIP")],
-                  widgets=[C_FF["clip_l"], C_FF["t5xxl"], "flux"])
-    vae = G.node("VAELoader", (x, 360), outputs=[("VAE", "VAE")], widgets=[C_FF["vae"]])
+def flux_fill_loaders(G, x=-1500, device=None):
+    """device: a ComfyUI-MultiGPU device string (e.g. "cuda:1") to pin these loaders'
+    models to a dedicated GPU. Uses the pack's *MultiGPU node variants -- confirmed real
+    via its actual source (UNETLoaderMultiGPU/VAELoaderMultiGPU/DualCLIPLoaderMultiGPU
+    each add a trailing "device" widget onto the vanilla loader). None keeps the vanilla
+    node types (whatever device ComfyUI's own default resolves to)."""
+    unet_type = "UNETLoaderMultiGPU" if device else "UNETLoader"
+    clip_type = "DualCLIPLoaderMultiGPU" if device else "DualCLIPLoader"
+    vae_type = "VAELoaderMultiGPU" if device else "VAELoader"
+    unet_widgets = [C_FF["diffusion"], "fp8_e4m3fn"] + ([device] if device else [])
+    clip_widgets = [C_FF["clip_l"], C_FF["t5xxl"], "flux"] + ([device] if device else [])
+    vae_widgets = [C_FF["vae"]] + ([device] if device else [])
+
+    unet = G.node(unet_type, (x, 0), outputs=[("MODEL", "MODEL")], widgets=unet_widgets)
+    clip = G.node(clip_type, (x, 180), outputs=[("CLIP", "CLIP")], widgets=clip_widgets)
+    vae = G.node(vae_type, (x, 360), outputs=[("VAE", "VAE")], widgets=vae_widgets)
     diff = G.node("DifferentialDiffusion", (x, 540), inputs=[("model", "MODEL")],
                   outputs=[("MODEL", "MODEL")])
     G.link(unet, "MODEL", diff, "model", "MODEL")
@@ -178,41 +236,6 @@ def dump(G, name):
         json.dump(out, f, indent=1)
     print(f"wrote {path}")
     lint(out)
-
-
-def emit_single_subgraph(G, name, proxy_nodes, category="LTX23", pos=(0, 0)):
-    """Wrap an entire flat Graph G into ONE collapsed native subgraph instance.
-
-    No wires cross the boundary -- every control the user needs is surfaced as a
-    proxied widget directly on the single outer box, in `proxy_nodes` order (that
-    order is what determines the visual grouping when the box is collapsed).
-    """
-    def_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "ltx23-extracted-sub/" + name))
-    def_links = [{"id": lid, "origin_id": fid, "origin_slot": fs, "target_id": tid,
-                  "target_slot": ts, "type": typ} for lid, fid, fs, tid, ts, typ in G.links]
-    subdef = {
-        "id": def_id, "version": 1, "revision": 0, "name": name, "category": category,
-        "description": "", "inputNode": {"id": -10, "bounding": [-260, -100, 150, 240]},
-        "outputNode": {"id": -20, "bounding": [640, -100, 150, 240]},
-        "inputs": [], "outputs": [], "widgets": [], "groups": [],
-        "state": {"lastNodeId": max((n.id for n in G.nodes.values()), default=0),
-                  "lastLinkId": 0, "lastGroupId": 0, "lastRerouteId": 0},
-        "config": {}, "extra": {},
-        "nodes": [n.to_dict() for n in G.nodes.values()], "links": def_links,
-    }
-    instance = {
-        "id": 9001, "type": def_id, "pos": list(pos), "size": {"0": 320, "1": 400},
-        "flags": {}, "order": 0, "mode": 0, "inputs": [], "outputs": [],
-        "properties": {"cnr_id": "comfy-core", "ver": "0.3.43",
-                       "proxyWidgets": [[str(n.id), WIDGET_KEY[n.type]] for n in proxy_nodes]},
-        "widgets_values": [],
-    }
-    return {
-        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "ltx23-extracted-sub-top/" + name)),
-        "revision": 0, "last_node_id": instance["id"], "last_link_id": 0,
-        "nodes": [instance], "links": [], "groups": [], "config": {}, "extra": {},
-        "version": 0.4, "definitions": {"subgraphs": [subdef]}, "floatingLinks": [],
-    }
 
 
 def dump_subgraph(sg, name):
@@ -312,6 +335,9 @@ def emit_subgraph_with_image_seed(G, name, proxy_nodes, ext_node, wires, categor
     }
 
 
+GROUP_COLOR = "#3f789e"
+
+
 def emit_subgraph_with_image_seeds(G, name, proxy_nodes, ext_nodes, wires, category="LTX23"):
     """Like emit_subgraph_with_image_seed, but for MULTIPLE real external LoadImage nodes
     (e.g. Video Gen's first/mid/last keyframe seeds) instead of just one.
@@ -341,7 +367,11 @@ def emit_subgraph_with_image_seeds(G, name, proxy_nodes, ext_nodes, wires, categ
         if key not in input_slot_ix:
             ix = len(input_defs)
             input_slot_ix[key] = ix
-            label = ext_node.title or ext_slot
+            # Label: node title for the primary (IMAGE) socket; for secondary outputs
+            # (e.g. ENABLE) append the output name so a multi-output node's sockets read
+            # distinctly -- e.g. "first frame" (IMAGE) vs "first frame · enable" (BOOLEAN).
+            base = ext_node.title or ext_slot
+            label = base if out_type[ext_node.id][ext_slot] == "IMAGE" else f"{base} · {ext_slot.lower()}"
             input_defs.append({
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{name}-extin-{ext_node.id}-{ext_slot}")),
                 "name": label, "type": out_type[ext_node.id][ext_slot], "linkIds": [],
@@ -413,13 +443,16 @@ def build_ideogram():
     G = Graph()
     tw, th = res_primitives(G)
 
-    unet = G.node("UNETLoader", (-1500, 0), outputs=[("MODEL", "MODEL")],
-                  widgets=[C_ID["diffusion"], "default"])
-    unet_neg = G.node("UNETLoader", (-1500, 180), outputs=[("MODEL", "MODEL")],
-                      widgets=[C_ID["unconditional"], "default"])
-    clip = G.node("CLIPLoader", (-1500, 360), outputs=[("CLIP", "CLIP")],
-                  widgets=[C_ID["clip"], "ideogram4", "default"])
-    vae = G.node("VAELoader", (-1500, 540), outputs=[("VAE", "VAE")], widgets=[C_ID["vae"]])
+    # Pinned to a dedicated GPU via ComfyUI-MultiGPU's *MultiGPU loader variants -- see
+    # GPU_IMAGEGEN's definition for why (model residency, not per-node parallel compute).
+    unet = G.node("UNETLoaderMultiGPU", (-1500, 0), outputs=[("MODEL", "MODEL")],
+                  widgets=[C_ID["diffusion"], "default", GPU_IMAGEGEN])
+    unet_neg = G.node("UNETLoaderMultiGPU", (-1500, 180), outputs=[("MODEL", "MODEL")],
+                      widgets=[C_ID["unconditional"], "default", GPU_IMAGEGEN])
+    clip = G.node("CLIPLoaderMultiGPU", (-1500, 360), outputs=[("CLIP", "CLIP")],
+                  widgets=[C_ID["clip"], "ideogram4", GPU_IMAGEGEN])
+    vae = G.node("VAELoaderMultiGPU", (-1500, 540), outputs=[("VAE", "VAE")],
+                 widgets=[C_ID["vae"], GPU_IMAGEGEN])
 
     pos = G.node("CLIPTextEncode", (-1000, 0), inputs=[("clip", "CLIP")],
                  outputs=[("CONDITIONING", "CONDITIONING")],
@@ -448,21 +481,28 @@ def build_ideogram():
     G.link(tw, "INT", empty_lat, "width", "INT")
     G.link(th, "INT", empty_lat, "height", "INT")
 
-    # optional "image seed" = img2img reference
-    ref_img = G.node("LoadImage", (-1320, 500),
-                     inputs=[("image", "COMBO", "image"), ("upload", "IMAGEUPLOAD", "upload")],
-                     outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=["example.png", "image"],
-                     title="image seed (optional img2img ref)", tunable=True)
+    # Optional "image seed" = img2img reference. ONE node per lane: LoadImageWithEnable
+    # (custom node, generator/custom_nodes/ltx23_helpers) bundles the image picker + an
+    # enable checkbox, inheriting LoadImage's upload button / preview thumbnail /
+    # mask-editor (the UI attaches to the image_upload widget metadata, not the LoadImage
+    # type -- verified via PainterNode precedent). Its ENABLE output fans to the same
+    # Switch consumers the separate toggle used to. Enable defaults OFF -- nothing happens
+    # with the reference unless explicitly turned on. (Replaces the earlier 2-node
+    # LoadImage + PrimitiveBoolean pair: no stock/installed node combines an image picker
+    # with a boolean toggle, so a small custom node is the only literal single-node way.)
+    EG_ref = Graph()
+    ref_img = EG_ref.node("LoadImageWithEnable", (0, 0),
+                          inputs=[("image", "COMBO", "image"), ("enable", "BOOLEAN", "enable"),
+                                  ("upload", "IMAGEUPLOAD", "upload")],
+                          outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK"), ("ENABLE", "BOOLEAN")],
+                          widgets=["example.png", False, "image"], title="image seed (optional img2img ref)")
+
     ref_lat = G.node("VAEEncode", (-1000, 640), inputs=[("pixels", "IMAGE"), ("vae", "VAE")],
                      outputs=[("LATENT", "LATENT")])
-    G.link(ref_img, "IMAGE", ref_lat, "pixels", "IMAGE")
     G.link(vae, "VAE", ref_lat, "vae", "VAE")
-    toggle = G.node("PrimitiveBoolean", (-1320, 760), outputs=[("BOOLEAN", "BOOLEAN")],
-                    widgets=[False], title="use image seed ON/OFF", tunable=True)
     lat_sw = G.node("ComfySwitchNode", (-1000, 780),
                     inputs=[("switch", "BOOLEAN", "switch"), ("on_true", "LATENT"), ("on_false", "LATENT")],
                     outputs=[("output", "LATENT")], widgets=[False])
-    G.link(toggle, "BOOLEAN", lat_sw, "switch", "BOOLEAN")
     G.link(ref_lat, "LATENT", lat_sw, "on_true", "LATENT")
     G.link(empty_lat, "LATENT", lat_sw, "on_false", "LATENT")
 
@@ -474,7 +514,6 @@ def build_ideogram():
     sig_sw = G.node("ComfySwitchNode", (-1000, 1060),
                     inputs=[("switch", "BOOLEAN", "switch"), ("on_true", "SIGMAS"), ("on_false", "SIGMAS")],
                     outputs=[("output", "SIGMAS")], widgets=[False])
-    G.link(toggle, "BOOLEAN", sig_sw, "switch", "BOOLEAN")
     G.link(sig_img, "SIGMAS", sig_sw, "on_true", "SIGMAS")
     G.link(sig_txt, "SIGMAS", sig_sw, "on_false", "SIGMAS")
 
@@ -502,11 +541,15 @@ def build_ideogram():
     preview = G.node("PreviewImage", (-680, 1800), inputs=[("images", "IMAGE")], title="preview")
     G.link(crop, "IMAGE", preview, "images", "IMAGE")
 
-    # Everything above lives INSIDE the collapsed box. Only these 7 widgets are proxied
-    # onto the outer instance, in 4 visual groups: (pos,neg) / (image seed,toggle) /
-    # (width,height) / (save filename). No wires cross the boundary at all.
-    proxy_order = [pos, neg, ref_img, toggle, tw, th, save]
-    sg = emit_single_subgraph(G, "Image Generation", proxy_order)
+    # Loaders/guider/schedulers/sampler/decode/crop live inside the box; image seed +
+    # toggle are real external nodes (see above). 5 widgets proxied: (pos,neg) /
+    # (width,height,save filename).
+    proxy_order = [pos, neg, tw, th, save]
+    ext_nodes = [ref_img]
+    wires = [(ref_img, "IMAGE", ref_lat, "pixels"),
+             (ref_img, "ENABLE", lat_sw, "switch"),
+             (ref_img, "ENABLE", sig_sw, "switch")]
+    sg = emit_subgraph_with_image_seeds(G, "Image Generation", proxy_order, ext_nodes, wires)
     dump_subgraph(sg, "Ideogram-Image-Gen-1080p")
 
 
@@ -517,7 +560,7 @@ def build_ideogram():
 def build_inpaint():
     G = Graph()
     tw, th = res_primitives(G)
-    flux = flux_fill_loaders(G)
+    flux = flux_fill_loaders(G, device=GPU_INPAINT)
 
     # LoadImage stays OUTSIDE the collapsed box as a real node (see
     # emit_subgraph_with_image_seed docstring) -- proxying it broke the mask editor for
@@ -583,7 +626,7 @@ def build_inpaint():
 def build_outpaint():
     G = Graph()
     tw, th = res_primitives(G)
-    flux = flux_fill_loaders(G)
+    flux = flux_fill_loaders(G, device=GPU_OUTPAINT)
 
     # LoadImage stays OUTSIDE the collapsed box as a real node (see
     # emit_subgraph_with_image_seed docstring) -- proxying it broke reliable
@@ -679,16 +722,25 @@ def build_outpaint():
 # 4. LTX-2.3-Video-Gen-1080p
 # --------------------------------------------------------------------------------------
 
-def _guide_stage(G, stage, x, y0, cond, base_lat, frames, toggles, ltx):
-    """Chain 3 gated LTXVAddGuide (first/mid/last). Returns (final pos/neg/lat switch
-    nodes, {name: guide_node}). Each guide's "image" input is left UNLINKED here --
-    frames[name][0] is a real EXTERNAL LoadImage node (see mask-editor gotcha), so the
-    caller wires it in via emit_subgraph_with_image_seeds instead of a plain G.link."""
+def _guide_stage(G, stage, x, y0, cond, base_lat, frames, ltx):
+    """Chain gated LTXVAddGuide lanes (mid/last -- first is handled separately via
+    LTXVImgToVideoConditionOnly, see build_video()'s docstring note on GH#12832). Returns
+    (final pos/neg/lat switch nodes, {name: guide_node}, {name: (swp, swn, swl)}). Each
+    guide's "image" input AND each switch's "switch" (toggle) input are left UNLINKED
+    here -- frames[name][0] and the gen toggles are real EXTERNAL nodes (see mask-editor
+    gotcha + toggle-visibility gotcha), so the caller wires them in via
+    emit_subgraph_with_image_seeds instead of a plain G.link."""
     cur_pos, cur_neg, cur_lat = cond, cond, base_lat
     pos_slot, neg_slot = "positive", "negative"
-    lat_slot = "LATENT" if base_lat.type in ("EmptyLTXVLatentVideo", "LTXVLatentUpsampler") else "output"
+    if base_lat.type in ("EmptyLTXVLatentVideo", "LTXVLatentUpsampler"):
+        lat_slot = "LATENT"
+    elif base_lat.type == "LTXVImgToVideoConditionOnly":
+        lat_slot = "latent"
+    else:
+        lat_slot = "output"
     guides = {}
-    for name in ("first", "mid", "last"):
+    switches = {}
+    for name in ("mid", "last"):
         img, idx, s1, s2, _ = frames[name]
         strength = s1 if stage == "stage1" else s2
         idx_literal = idx if isinstance(idx, int) else 0
@@ -714,8 +766,7 @@ def _guide_stage(G, stage, x, y0, cond, base_lat, frames, toggles, ltx):
         swl = G.node("ComfySwitchNode", (x + 360, y0 + 240),
                      inputs=[("switch", "BOOLEAN", "switch"), ("on_true", "LATENT"), ("on_false", "LATENT")],
                      outputs=[("output", "LATENT")], widgets=[False])
-        for sw in (swp, swn, swl):
-            G.link(toggles[name], "BOOLEAN", sw, "switch", "BOOLEAN")
+        switches[name] = (swp, swn, swl)
         G.link(guide, "positive", swp, "on_true", "CONDITIONING")
         G.link(cur_pos, pos_slot, swp, "on_false", "CONDITIONING")
         G.link(guide, "negative", swn, "on_true", "CONDITIONING")
@@ -725,7 +776,7 @@ def _guide_stage(G, stage, x, y0, cond, base_lat, frames, toggles, ltx):
         cur_pos, cur_neg, cur_lat = swp, swn, swl
         pos_slot = neg_slot = lat_slot = "output"
         y0 += 380
-    return cur_pos, cur_neg, cur_lat, guides
+    return cur_pos, cur_neg, cur_lat, guides, switches
 
 
 def build_video():
@@ -750,8 +801,15 @@ def build_video():
 
     c = C_LTX
     x = 900
-    ckpt = G.node("CheckpointLoaderSimple", (x, 0),
-                  outputs=[("MODEL", "MODEL"), ("CLIP", "CLIP"), ("VAE", "VAE")], widgets=[c["checkpoint"]])
+    # Pinned to a dedicated GPU (see GPU_VIDEO). NOTE: ComfyUI-MultiGPU (as installed) only
+    # wraps CheckpointLoaderSimple among this stage's loaders -- confirmed via its actual
+    # source, no *MultiGPU variant exists for LTXVAudioVAELoader, LatentUpscaleModelLoader,
+    # or LTXAVTextEncoderLoader (LTX-2.3-specific nodes newer than that pack's LTX
+    # integration). Those three stay on whatever ComfyUI's own default device is; only the
+    # main ~22B-parameter LTX checkpoint (the largest, most impactful piece) gets isolated.
+    ckpt = G.node("CheckpointLoaderSimpleMultiGPU", (x, 0),
+                  outputs=[("MODEL", "MODEL"), ("CLIP", "CLIP"), ("VAE", "VAE")],
+                  widgets=[c["checkpoint"], GPU_VIDEO])
     lora = G.node("LoraLoaderModelOnly", (x, 200), inputs=[("model", "MODEL")], outputs=[("MODEL", "MODEL")],
                   widgets=[c["distilled_lora"], 0.5])
     G.link(ckpt, "MODEL", lora, "model", "MODEL")
@@ -797,40 +855,91 @@ def build_video():
     mid_idx = math_expr(G, (x - 320, 1980), "((a-1)//2)//8*8", res["num_frames"], "INT",
                         title="mid frame index (live, 8k-aligned)")
 
-    # Optional keyframe "seeds" (LoadImage) -- used only if the frame's gen toggle is ON.
-    # Kept as REAL external nodes (not proxied), same reasoning as Inpaint/Outpaint's image
-    # seed: a proxied LoadImage loses its preview thumbnail for already-uploaded files.
-    # Built in a SHARED throwaway Graph() so all three get unique sequential ids (1,2,3)
-    # instead of each starting fresh at id=1 (which would collide once placed together).
+    # Optional keyframe lanes -- ONE node each. LoadImageWithEnable (custom node,
+    # generator/custom_nodes/ltx23_helpers) bundles the image picker + an enable checkbox,
+    # inheriting LoadImage's upload button / preview thumbnail (and mask-editor, though
+    # video keyframes don't need it). Its ENABLE output fans to the same Switch consumers
+    # the separate toggles used to. No stock/installed node combines an image picker with
+    # a boolean toggle (verified across all 1202 live /object_info types), so this small
+    # custom node is the only literal way to get "image + toggle in one node" -- i.e. the
+    # 3 external input nodes the user asked for (was 6: 3 LoadImage + 3 PrimitiveBoolean).
+    # First/last default OFF, mid follows CONFIG (unchanged from before). Built in a SHARED
+    # throwaway Graph() so all three get unique sequential ids (1-3).
     EG = Graph()
-    first_img = EG.node("LoadImage", (0, 0),
-                        inputs=[("image", "COMBO", "image"), ("upload", "IMAGEUPLOAD", "upload")],
-                        outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=["example.png", "image"],
-                        title="first frame seed (optional)")
-    mid_img = EG.node("LoadImage", (340, 0),
-                      inputs=[("image", "COMBO", "image"), ("upload", "IMAGEUPLOAD", "upload")],
-                      outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=["example.png", "image"],
-                      title="mid frame seed (optional)")
-    last_img = EG.node("LoadImage", (680, 0),
-                       inputs=[("image", "COMBO", "image"), ("upload", "IMAGEUPLOAD", "upload")],
-                       outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=["example.png", "image"],
-                       title="last frame seed (optional)")
+    # Widget ORDER for LoadImageWithEnable is [image, enable, upload] (verified live against
+    # the frontend's own canonical serialization -- the upload widget is appended AFTER the
+    # declared widgets). So widgets_values must be [filename, enable_bool, "image"]; putting
+    # the upload string at index 1 would land on `enable` and coerce to truthy True, silently
+    # forcing every lane ON (the bug that made mid/last keyframes apply despite "off").
+    _li_inputs = [("image", "COMBO", "image"), ("enable", "BOOLEAN", "enable"),
+                  ("upload", "IMAGEUPLOAD", "upload")]
+    _li_outputs = [("IMAGE", "IMAGE"), ("MASK", "MASK"), ("ENABLE", "BOOLEAN")]
+    first_img = EG.node("LoadImageWithEnable", (0, 0), inputs=_li_inputs, outputs=_li_outputs,
+                        widgets=["example.png", False, "image"], title="first frame")
+    mid_img = EG.node("LoadImageWithEnable", (340, 0), inputs=_li_inputs, outputs=_li_outputs,
+                      widgets=["example.png", CONFIG["gen_mid"], "image"], title="mid frame")
+    last_img = EG.node("LoadImageWithEnable", (680, 0), inputs=_li_inputs, outputs=_li_outputs,
+                       widgets=["example.png", False, "image"], title="last frame")
 
+    # First-frame conditioning uses LTXVImgToVideoConditionOnly (noise-mask based) instead
+    # of LTXVAddGuide, matching Lightricks' own official two-stage reference template
+    # EXACTLY (LTX-2.3_T2V_I2V_Two_Stage_Distilled.json) -- confirmed live via /object_info
+    # and by reading that template's actual node graph. This sidesteps a known, still-open
+    # bug: Comfy-Org/ComfyUI#12832 "LTXVAddGuide node last 1 second very bad", an EXACT
+    # match for our setup (first=0, last=-1 frame_idx) and the tail-end camera-cut/color
+    # artifact confirmed live in this project. LTXVImgToVideoConditionOnly is documented as
+    # first-frames-only, so mid/last still use LTXVAddGuide (no official alternative
+    # exists for those positions -- accept the known-bug risk there).
+    #
+    # Official strengths (0.7 stage1, 1.0 stage2) are used as-is -- ImgToVideoConditionOnly
+    # caps strength at 1.0 (unlike LTXVAddGuide's 0-10 range), so our earlier "raised
+    # strength" values don't carry over; these are the proven, tested defaults instead.
+    STRENGTH_FIRST_S1, STRENGTH_FIRST_S2 = 0.7, 1.0
+    # Last-frame guide strength, [stage1, stage2]. Was (1.4, 1.8) -- over-raised during the
+    # earlier "keyframes not respected" fix; at that level LTX's temporal attention bleeds the
+    # last-keyframe pull across the whole back half of the latent and the model freezes on it
+    # (confirmed live: the back ~2s of a 4s clip decoded as a frozen last-keyframe still).
+    # Back to the node's default 1.0 for both stages: respected but not frozen. stage2's value
+    # is proxied on the box (s2_guides["last"] in proxy_order), so it's tunable per-run --
+    # raise it if the last keyframe isn't sticking, lower it if the tail freezes.
+    STRENGTH_LAST = (1.0, 1.0)
+    # Toggles for first/last default to OFF (was True on first/last originally) -- nothing
+    # happens unless explicitly turned on, which avoids the still-unset example.png
+    # placeholder getting used as a real keyframe just because a fresh workflow's defaults
+    # happened to be ON. Matches the official template's own bypass_i2v default (True =
+    # bypassed) too.
     frames = {
-        "first": (first_img, 0, CONFIG["strength_first"][0], CONFIG["strength_first"][1], CONFIG["gen_first"]),
         "mid": (mid_img, mid_idx, CONFIG["strength_mid"][0], CONFIG["strength_mid"][1], CONFIG["gen_mid"]),
-        "last": (last_img, -1, CONFIG["strength_last"][0], CONFIG["strength_last"][1], CONFIG["gen_last"]),
+        "last": (last_img, -1, STRENGTH_LAST[0], STRENGTH_LAST[1], False),
     }
-    t_first = G.node("PrimitiveBoolean", (x - 320, 0), outputs=[("BOOLEAN", "BOOLEAN")],
-                     widgets=[CONFIG["gen_first"]], title="use first frame ON/OFF", tunable=True)
-    t_mid = G.node("PrimitiveBoolean", (x - 320, 1480), outputs=[("BOOLEAN", "BOOLEAN")],
-                   widgets=[CONFIG["gen_mid"]], title="use mid frame ON/OFF", tunable=True)
-    t_last = G.node("PrimitiveBoolean", (x - 320, 2200), outputs=[("BOOLEAN", "BOOLEAN")],
-                    widgets=[CONFIG["gen_last"]], title="use last frame ON/OFF", tunable=True)
-    toggles = {"first": t_first, "mid": t_mid, "last": t_last}
+
+    # First-frame preprocessing chain, matching the official template: resize (longer edge
+    # 1536, lanczos) once, feeding BOTH stage1 (via LTXVPreprocess, compression=18) and
+    # stage2 (direct, no preprocess) conditioning. `not_first` inverts the first-frame
+    # node's ENABLE checkbox into the `bypass` boolean ImgToVideoConditionOnly expects
+    # (bypass=True means "don't use it", the opposite of ENABLE's semantics).
+    resize_first = G.node("ResizeImageMaskNode", (x - 700, 200),
+                          inputs=[("input", "IMAGE,MASK")], outputs=[("resized", "IMAGE")],
+                          widgets=["scale longer dimension", 1536, "lanczos"])
+    preprocess_first = G.node("LTXVPreprocess", (x - 700, 340),
+                              inputs=[("image", "IMAGE"), ("img_compression", "INT")],
+                              outputs=[("output_image", "IMAGE")], widgets=[18])
+    G.link(resize_first, "resized", preprocess_first, "image", "IMAGE")
+    not_first = G.node("ComfyNotNode", (x - 700, 460), inputs=[("value", "*")],
+                       outputs=[("BOOLEAN", "BOOLEAN")])
+
+    cond_first_s1 = G.node("LTXVImgToVideoConditionOnly", (x - 320, 1480),
+                           inputs=[("vae", "VAE"), ("image", "IMAGE"), ("latent", "LATENT"),
+                                   ("strength", "FLOAT", "strength"), ("bypass", "BOOLEAN", "bypass")],
+                           outputs=[("latent", "LATENT")], widgets=[STRENGTH_FIRST_S1, False],
+                           title="stage1 first-frame condition")
+    G.link(ckpt, "VAE", cond_first_s1, "vae", "VAE")
+    G.link(preprocess_first, "output_image", cond_first_s1, "image", "IMAGE")
+    G.link(vid_lat, "LATENT", cond_first_s1, "latent", "LATENT")
+    G.link(not_first, "BOOLEAN", cond_first_s1, "bypass", "BOOLEAN")
 
     ltx = {"vae": ckpt, "lora": lora, "audio_vae": audio_vae, "upscaler": upscaler}
-    s1_pos, s1_neg, s1_lat, s1_guides = _guide_stage(G, "stage1", x + 500, 0, cond, vid_lat, frames, toggles, ltx)
+    s1_pos, s1_neg, s1_lat, s1_guides, s1_switches = _guide_stage(G, "stage1", x + 500, 0, cond, cond_first_s1, frames, ltx)
 
     concat1 = G.node("LTXVConcatAVLatent", (x + 1100, 0),
                      inputs=[("video_latent", "LATENT"), ("audio_latent", "LATENT")], outputs=[("latent", "LATENT")])
@@ -843,7 +952,7 @@ def build_video():
     G.link(s1_pos, "output", g1, "positive", "CONDITIONING")
     G.link(s1_neg, "output", g1, "negative", "CONDITIONING")
     samp1 = G.node("KSamplerSelect", (x + 1100, 300), outputs=[("SAMPLER", "SAMPLER")], widgets=["euler_ancestral_cfg_pp"])
-    noise1 = G.node("RandomNoise", (x + 1100, 420), outputs=[("NOISE", "NOISE")], widgets=[SEED, "fixed"])
+    noise1 = G.node("RandomNoise", (x + 1100, 420), outputs=[("NOISE", "NOISE")], widgets=[SEED, "randomize"])
     sig1 = G.node("ManualSigmas", (x + 1100, 540), outputs=[("SIGMAS", "SIGMAS")], widgets=[SIGMAS_S1])
     ks1 = G.node("SamplerCustomAdvanced", (x + 1100, 680),
                  inputs=[("noise", "NOISE"), ("guider", "GUIDER"), ("sampler", "SAMPLER"),
@@ -857,14 +966,45 @@ def build_video():
                   outputs=[("video_latent", "LATENT"), ("audio_latent", "LATENT")])
     G.link(ks1, "output", sep1, "av_latent", "LATENT")
 
+    # Strips stale keyframe-guide metadata (and any temporal padding LTXVAddGuide injected
+    # to encode the reference image) from stage1's output BEFORE it's upsampled -- confirmed
+    # via a live diff against the user's own known-good reference workflow
+    # (LTS-2.3-1080p.json) that it does this exact crop at this exact point (after
+    # LTXVSeparateAVLatent, before the latent is reused) and does NOT exhibit the tail-end
+    # camera-cut/color-flicker artifact we hit without it. We don't otherwise reuse stage1's
+    # conditioning (stage2 rebuilds its own guides from `cond`), so only the cropped LATENT
+    # output matters here -- the conditioning outputs are unused, which is fine.
+    crop_guides = G.node("LTXVCropGuides", (x + 1300, 860),
+                         inputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING"),
+                                 ("latent", "LATENT")],
+                         outputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING"),
+                                  ("latent", "LATENT")])
+    G.link(s1_pos, "output", crop_guides, "positive", "CONDITIONING")
+    G.link(s1_neg, "output", crop_guides, "negative", "CONDITIONING")
+    G.link(sep1, "video_latent", crop_guides, "latent", "LATENT")
+
     up = G.node("LTXVLatentUpsampler", (x + 1500, 0),
                 inputs=[("samples", "LATENT"), ("upscale_model", "LATENT_UPSCALE_MODEL"), ("vae", "VAE")],
                 outputs=[("LATENT", "LATENT")])
-    G.link(sep1, "video_latent", up, "samples", "LATENT")
+    G.link(crop_guides, "latent", up, "samples", "LATENT")
     G.link(upscaler, "LATENT_UPSCALE_MODEL", up, "upscale_model", "LATENT_UPSCALE_MODEL")
     G.link(ckpt, "VAE", up, "vae", "VAE")
 
-    s2_pos, s2_neg, s2_lat, s2_guides = _guide_stage(G, "stage2", x + 1900, 0, cond, up, frames, toggles, ltx)
+    # Stage2's first-frame conditioning reuses resize_first's DIRECT output (no
+    # LTXVPreprocess -- matches the official template, which only preprocesses for
+    # stage1) at full strength (1.0) on the freshly-upsampled latent. tunable=True so its
+    # "strength" widget can be proxied below.
+    cond_first_s2 = G.node("LTXVImgToVideoConditionOnly", (x + 1700, 200),
+                           inputs=[("vae", "VAE"), ("image", "IMAGE"), ("latent", "LATENT"),
+                                   ("strength", "FLOAT", "strength"), ("bypass", "BOOLEAN", "bypass")],
+                           outputs=[("latent", "LATENT")], widgets=[STRENGTH_FIRST_S2, False],
+                           title="stage2 first-frame condition", tunable=True)
+    G.link(ckpt, "VAE", cond_first_s2, "vae", "VAE")
+    G.link(resize_first, "resized", cond_first_s2, "image", "IMAGE")
+    G.link(up, "LATENT", cond_first_s2, "latent", "LATENT")
+    G.link(not_first, "BOOLEAN", cond_first_s2, "bypass", "BOOLEAN")
+
+    s2_pos, s2_neg, s2_lat, s2_guides, s2_switches = _guide_stage(G, "stage2", x + 1900, 0, cond, cond_first_s2, frames, ltx)
     concat2 = G.node("LTXVConcatAVLatent", (x + 2400, 0),
                      inputs=[("video_latent", "LATENT"), ("audio_latent", "LATENT")], outputs=[("latent", "LATENT")])
     G.link(s2_lat, "output", concat2, "video_latent", "LATENT")
@@ -876,7 +1016,11 @@ def build_video():
     G.link(s2_pos, "output", g2, "positive", "CONDITIONING")
     G.link(s2_neg, "output", g2, "negative", "CONDITIONING")
     samp2 = G.node("KSamplerSelect", (x + 2400, 300), outputs=[("SAMPLER", "SAMPLER")], widgets=["euler_cfg_pp"])
-    noise2 = G.node("RandomNoise", (x + 2400, 420), outputs=[("NOISE", "NOISE")], widgets=[SEED + 1, "fixed"])
+    # Both noise seeds randomize (was "fixed") -- with a fixed seed + identical inputs,
+    # ComfyUI caches and returns the EXACT same video every queue (user hit this: 3 queued
+    # jobs -> 3 identical outputs). Randomize gives a different video per run. To reproduce
+    # a good one, switch back to "fixed" and paste the seed.
+    noise2 = G.node("RandomNoise", (x + 2400, 420), outputs=[("NOISE", "NOISE")], widgets=[SEED + 1, "randomize"])
     sig2 = G.node("ManualSigmas", (x + 2400, 540), outputs=[("SIGMAS", "SIGMAS")], widgets=[SIGMAS_S2])
     ks2 = G.node("SamplerCustomAdvanced", (x + 2400, 680),
                  inputs=[("noise", "NOISE"), ("guider", "GUIDER"), ("sampler", "SAMPLER"),
@@ -889,6 +1033,14 @@ def build_video():
                   outputs=[("video_latent", "LATENT"), ("audio_latent", "LATENT")])
     G.link(ks2, "output", sep2, "av_latent", "LATENT")
 
+    # NOTE: stage2's guide padding is NOT cropped here before decode. A stage2 LTXVCropGuides
+    # was tried and REVERTED -- LTXVCropGuides crops only from the END of the latent
+    # (latent[:,:,:-num_keyframes]), which is correct for a last-frame guide but WRONG for a
+    # mid-frame guide (its padding sits in the middle, so end-cropping chops real frames).
+    # With mid enabled that produced a 161-frame broken output. The cost of NOT cropping
+    # stage2 is a minor ~8-frame end-hold on the last keyframe (0.33s) when the last frame is
+    # used -- acceptable, and far safer than the mid-interaction failure mode. stage1's
+    # crop_guides (above) stays, since stage1's cropped latent is reused by the upscaler.
     vdec = G.node("LTXVTiledVAEDecode", (x + 2900, 0), inputs=[("vae", "VAE"), ("latents", "LATENT")],
                   outputs=[("image", "IMAGE")], widgets=[2, 2, 6, False, "auto", "auto"])
     G.link(ckpt, "VAE", vdec, "vae", "VAE")
@@ -910,24 +1062,263 @@ def build_video():
                   widgets=["LTX23_VideoGen_1080p", "auto", "auto"])
     G.link(cvid, "VIDEO", save, "video", "VIDEO")
 
-    # Loaders/schedulers/samplers/guides/decode/crop/mux all live inside the box. Only
-    # what the user actually needs to touch is proxied, in the requested order: prompts /
-    # images (the 3 gen toggles -- the LoadImage nodes themselves are real external nodes,
-    # not proxied, per the mask-editor gotcha) / duration / width,height / fps.
-    proxy_order = [pos, neg, t_first, t_mid, t_last, dur, tw, th, fps]
+    # Loaders/schedulers/samplers/guides/decode/crop/mux all live inside the box. Keyframe
+    # images AND their ON/OFF toggles are real external nodes in the main canvas (see
+    # above); only prompts, keyframe strength (first via ImgToVideoConditionOnly's own
+    # stage2 strength; last via stage2's guide -- the final/most perceptually impactful
+    # pass in both cases; stage1 stays fixed), duration, and width/height/fps are proxied
+    # onto the box.
+    proxy_order = [pos, neg, cond_first_s2, s2_guides["last"], dur, tw, th, fps]
     ext_nodes = [first_img, mid_img, last_img]
-    wires = []
-    for name, ext in (("first", first_img), ("mid", mid_img), ("last", last_img)):
-        wires.append((ext, "IMAGE", s1_guides[name], "image"))
-        wires.append((ext, "IMAGE", s2_guides[name], "image"))
+    # Each lane's single node outputs IMAGE (fans to its guide consumers) AND ENABLE
+    # (fans to the same switch consumers the separate toggle used to, plus the first-frame
+    # inverter). Keyed by (node.id, output_name), so one node's IMAGE + ENABLE get distinct
+    # subgraph input sockets while repeated ENABLE wires from the same node collapse onto
+    # one shared socket and fan to all its targets.
+    wires = [(first_img, "IMAGE", resize_first, "input"),
+             (first_img, "ENABLE", not_first, "value")]
+    for name, img in (("mid", mid_img), ("last", last_img)):
+        wires.append((img, "IMAGE", s1_guides[name], "image"))
+        wires.append((img, "IMAGE", s2_guides[name], "image"))
+        for sw in s1_switches[name]:
+            wires.append((img, "ENABLE", sw, "switch"))
+        for sw in s2_switches[name]:
+            wires.append((img, "ENABLE", sw, "switch"))
     sg = emit_subgraph_with_image_seeds(G, "Video Generation", proxy_order, ext_nodes, wires)
     dump_subgraph(sg, "LTX-2.3-Video-Gen-1080p")
+
+
+def build_sdxl_flux_outpaint():
+    """5-stage seamless outpaint at 1080p: SDXL+ControlNet Union (repaint) -> restore
+    original center -> Flux Fill repaint of the border -> crop to 1920x1080.
+
+    Implements the "Seamless Outpainting with Flux in ComfyUI" flow: direct Flux outpaint
+    is weak, so SDXL + ControlNet Union promax (set to the "repaint" type) handles the
+    initial outpaint; the original center is composited back to restore exact details and
+    kill the seam; then a light Flux Fill pass (denoise 0.35) repaints just the border to
+    fix SDXL artifacts. The SDXL/ControlNet wiring follows xinsir's own
+    ControlNetPlus/workflow/outpaint.json reference exactly.
+
+    Canvas runs at full 1920x1088 (cropped to 1080p) -- NOT a smaller SDXL-friendly size +
+    upscale, because shrinking a high-res source to ~576px then upscaling produced weak,
+    flat outpainted borders (a visible "frame" around the original). Full res keeps the
+    source at native detail. (Caveat: SDXL is trained near 1MP, so 2MP is above its sweet
+    spot; for outpaint -- extending backgrounds, not full scenes -- this is acceptable, and
+    the Flux repaint pass cleans up artifacts.)
+
+    REQUIRES 2 downloaded models (both exposed as tunable pickers): an SDXL checkpoint
+    (C_SDXL.checkpoint) and ControlNet Union SDXL promax (C_SDXL.controlnet). Flux Fill /
+    clip_l / t5xxl / ae are already on the server. Uses VANILLA Flux loaders (no MultiGPU
+    device pinning -- see the flux_fill_loaders device-widget note).
+    """
+    G = Graph()
+    # Canvas runs at full output resolution (OUT_W x OUT_H = 1920x1088, cropped to 1080p at
+    # the end). Both tunable on the box. (Was 1024x576 + upscale -- that shrank a high-res
+    # source to 576px and produced weak, flat outpainted borders. Full-res fixes that.)
+    tw = G.node("PrimitiveInt", (-2200, 0), outputs=[("INT", "INT")], widgets=[OUT_W],
+                title="canvas width", tunable=True)
+    th = G.node("PrimitiveInt", (-2200, 120), outputs=[("INT", "INT")], widgets=[OUT_H],
+                title="canvas height", tunable=True)
+    # ONE prompt pair drives BOTH the SDXL and Flux text encoders (linked to each
+    # CLIPTextEncode.text so the user sets the outpaint prompt once).
+    pos_str = G.node("PrimitiveString", (-2200, 280), outputs=[("STRING", "STRING")],
+                     widgets=[""], title="positive prompt", tunable=True)
+    neg_str = G.node("PrimitiveString", (-2200, 400), outputs=[("STRING", "STRING")],
+                     widgets=[""], title="negative prompt", tunable=True)
+
+    img = Graph().node("LoadImage", (0, 0),
+                       inputs=[("image", "COMBO", "image"), ("upload", "IMAGEUPLOAD", "upload")],
+                       outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=["example.png", "image"],
+                       title="image to outpaint")
+
+    # ---- Stage 1: fit source inside the canvas (preserve aspect, never upscale), then pad
+    # the remainder to the working resolution -> padded IMAGE (source centered) + border MASK.
+    # (Same proven block as build_outpaint's stage 1.)
+    gis = G.node("GetImageSize", (-1900, -320), inputs=[("image", "IMAGE")],
+                 outputs=[("width", "INT"), ("height", "INT"), ("batch_size", "INT")])
+    scale_expr = G.node("ComfyMathExpression", (-1900, -160), title="outpaint fit-scale")
+    sa = scale_expr.add_input("values.a", "FLOAT,INT,BOOLEAN")
+    sb = scale_expr.add_input("values.b", "FLOAT,INT,BOOLEAN", shape=7)
+    sc = scale_expr.add_input("values.c", "FLOAT,INT,BOOLEAN", shape=7)
+    sd = scale_expr.add_input("values.d", "FLOAT,INT,BOOLEAN", shape=7)
+    scale_expr.add_input("expression", "STRING", widget="expression")
+    scale_expr.add_output("FLOAT", "FLOAT")
+    scale_expr.add_output("INT", "INT")
+    scale_expr.add_output("BOOL", "BOOLEAN")
+    scale_expr.widgets_values = ["min(1, a/b, c/d)"]
+    G.link(tw, "INT", scale_expr, sa, "FLOAT,INT,BOOLEAN")
+    G.link(gis, "width", scale_expr, sb, "FLOAT,INT,BOOLEAN")
+    G.link(th, "INT", scale_expr, sc, "FLOAT,INT,BOOLEAN")
+    G.link(gis, "height", scale_expr, sd, "FLOAT,INT,BOOLEAN")
+    fit = G.node("ImageScaleBy", (-1580, -320),
+                 inputs=[("image", "IMAGE"), ("scale_by", "FLOAT", "scale_by")],
+                 outputs=[("IMAGE", "IMAGE")], widgets=["lanczos", 1.0])
+    G.link(scale_expr, "FLOAT", fit, "scale_by", "FLOAT")
+    gis2 = G.node("GetImageSize", (-1260, -320), inputs=[("image", "IMAGE")],
+                  outputs=[("width", "INT"), ("height", "INT"), ("batch_size", "INT")])
+    G.link(fit, "IMAGE", gis2, "image", "IMAGE")
+    left = math_expr(G, (-1580, 0), "max(0, (a-b)//2)", tw, "INT", "pad left",
+                     b_src=gis2, b_slot="width")
+    right = math_expr(G, (-1580, 140), "max(0, (a-b)-((a-b)//2))", tw, "INT", "pad right",
+                      b_src=gis2, b_slot="width")
+    top = math_expr(G, (-1580, 280), "max(0, (a-b)//2)", th, "INT", "pad top",
+                    b_src=gis2, b_slot="height")
+    bottom = math_expr(G, (-1580, 420), "max(0, (a-b)-((a-b)//2))", th, "INT", "pad bottom",
+                       b_src=gis2, b_slot="height")
+    pad = G.node("ImagePadForOutpaint", (-1260, 0),
+                 inputs=[("image", "IMAGE"), ("left", "INT", "left"), ("top", "INT", "top"),
+                         ("right", "INT", "right"), ("bottom", "INT", "bottom")],
+                 outputs=[("IMAGE", "IMAGE"), ("MASK", "MASK")], widgets=[0, 0, 0, 0, 80])
+    G.link(fit, "IMAGE", pad, "image", "IMAGE")
+    G.link(left, "INT", pad, "left", "INT")
+    G.link(top, "INT", pad, "top", "INT")
+    G.link(right, "INT", pad, "right", "INT")
+    G.link(bottom, "INT", pad, "bottom", "INT")
+    # padded image = pad:IMAGE ; border mask = pad:MASK
+
+    # ---- Stage 2: SDXL outpaint with ControlNet Union (repaint type) -- xinsir reference.
+    ckpt = G.node("CheckpointLoaderSimple", (-1900, 600),
+                  outputs=[("MODEL", "MODEL"), ("CLIP", "CLIP"), ("VAE", "VAE")],
+                  widgets=[C_SDXL["checkpoint"]], title="SDXL checkpoint", tunable=True)
+    cn_load = G.node("ControlNetLoader", (-1900, 780), outputs=[("CONTROL_NET", "CONTROL_NET")],
+                     widgets=[C_SDXL["controlnet"]], title="ControlNet Union promax", tunable=True)
+    cn_type = G.node("SetUnionControlNetType", (-1900, 960),
+                     inputs=[("control_net", "CONTROL_NET")], outputs=[("CONTROL_NET", "CONTROL_NET")],
+                     widgets=["repaint"], title="set controlnet type = repaint")
+    G.link(cn_load, "CONTROL_NET", cn_type, "control_net", "CONTROL_NET")
+    # Control image = padded image with the border cleaned to pure black (xinsir's prep):
+    # paste MaskToImage(InvertMask(border)) into the border, leaving the original center.
+    inv = G.node("InvertMask", (-1580, 600), inputs=[("mask", "MASK")], outputs=[("MASK", "MASK")])
+    G.link(pad, "MASK", inv, "mask", "MASK")
+    m2i = G.node("MaskToImage", (-1580, 720), inputs=[("mask", "MASK")], outputs=[("IMAGE", "IMAGE")])
+    G.link(inv, "MASK", m2i, "mask", "MASK")
+    ctrl = G.node("ImageCompositeMasked", (-1260, 600),
+                  inputs=[("destination", "IMAGE"), ("source", "IMAGE"), ("mask", "MASK")],
+                  outputs=[("IMAGE", "IMAGE")], widgets=[0, 0, False], title="control image")
+    G.link(pad, "IMAGE", ctrl, "destination", "IMAGE")
+    G.link(m2i, "IMAGE", ctrl, "source", "IMAGE")
+    G.link(pad, "MASK", ctrl, "mask", "MASK")
+    # SDXL prompts (shared PrimitiveString -> SDXL CLIP).
+    sdxl_pos = G.node("CLIPTextEncode", (-1580, 900),
+                      inputs=[("clip", "CLIP"), ("text", "STRING", "text")],
+                      outputs=[("CONDITIONING", "CONDITIONING")], widgets=[""], title="SDXL positive")
+    G.link(ckpt, "CLIP", sdxl_pos, "clip", "CLIP")
+    G.link(pos_str, "STRING", sdxl_pos, "text", "STRING")
+    sdxl_neg = G.node("CLIPTextEncode", (-1580, 1020),
+                      inputs=[("clip", "CLIP"), ("text", "STRING", "text")],
+                      outputs=[("CONDITIONING", "CONDITIONING")], widgets=[""], title="SDXL negative")
+    G.link(ckpt, "CLIP", sdxl_neg, "clip", "CLIP")
+    G.link(neg_str, "STRING", sdxl_neg, "text", "STRING")
+    # Apply the typed controlnet (vae input is optional -> omitted, matching the reference).
+    cn_apply = G.node("ControlNetApplyAdvanced", (-1260, 900),
+                      inputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING"),
+                              ("control_net", "CONTROL_NET"), ("image", "IMAGE")],
+                      outputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING")],
+                      widgets=[1.0, 0.0, 1.0])
+    G.link(sdxl_pos, "CONDITIONING", cn_apply, "positive", "CONDITIONING")
+    G.link(sdxl_neg, "CONDITIONING", cn_apply, "negative", "CONDITIONING")
+    G.link(cn_type, "CONTROL_NET", cn_apply, "control_net", "CONTROL_NET")
+    G.link(ctrl, "IMAGE", cn_apply, "image", "IMAGE")
+    # Encode for inpaint; grow_mask_by widens the regenerated seam-blend zone.
+    vae_enc = G.node("VAEEncodeForInpaint", (-1260, 1080),
+                     inputs=[("pixels", "IMAGE"), ("vae", "VAE"), ("mask", "MASK")],
+                     outputs=[("LATENT", "LATENT")], widgets=[C_SDXL["grow_mask"]])
+    G.link(ctrl, "IMAGE", vae_enc, "pixels", "IMAGE")
+    G.link(ckpt, "VAE", vae_enc, "vae", "VAE")
+    G.link(pad, "MASK", vae_enc, "mask", "MASK")
+    ks_sdxl = G.node("KSampler", (-940, 900),
+                     inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
+                             ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
+                     outputs=[("LATENT", "LATENT")],
+                     widgets=[SEED, "randomize", C_SDXL["steps"], C_SDXL["cfg"], C_SDXL["sampler"],
+                              C_SDXL["scheduler"], 1.0], title="SDXL outpaint")
+    G.link(ckpt, "MODEL", ks_sdxl, "model", "MODEL")
+    G.link(cn_apply, "positive", ks_sdxl, "positive", "CONDITIONING")
+    G.link(cn_apply, "negative", ks_sdxl, "negative", "CONDITIONING")
+    G.link(vae_enc, "LATENT", ks_sdxl, "latent_image", "LATENT")
+    sdxl_dec = G.node("VAEDecode", (-940, 1080), inputs=[("samples", "LATENT"), ("vae", "VAE")],
+                      outputs=[("IMAGE", "IMAGE")], title="SDXL outpainted")
+    G.link(ks_sdxl, "LATENT", sdxl_dec, "samples", "LATENT")
+    G.link(ckpt, "VAE", sdxl_dec, "vae", "VAE")
+
+    # ---- Stage 3: paste the original center back -> restore exact details, kill the seam.
+    # The pad feathering softens the boundary; mask = inverted border mask (center only).
+    restore = G.node("ImageCompositeMasked", (-620, 900),
+                     inputs=[("destination", "IMAGE"), ("source", "IMAGE"), ("mask", "MASK")],
+                     outputs=[("IMAGE", "IMAGE")], widgets=[0, 0, False], title="restore original center")
+    G.link(sdxl_dec, "IMAGE", restore, "destination", "IMAGE")
+    G.link(ctrl, "IMAGE", restore, "source", "IMAGE")
+    G.link(inv, "MASK", restore, "mask", "MASK")
+
+    # ---- Stage 4: Flux Fill repaint of the border only (fix SDXL artifacts), denoise 0.35.
+    flux = flux_fill_loaders(G, x=-620, device=None)
+    grow = G.node("GrowMaskWithBlur", (-620, 1080), inputs=[("mask", "MASK")],
+                  outputs=[("MASK", "MASK")],
+                  widgets=[10, 0.0, True, False, 10.0, 1.0, 1.0, False],
+                  title="repaint mask (grow + blur)")
+    G.link(pad, "MASK", grow, "mask", "MASK")
+    flux_pos = G.node("CLIPTextEncode", (-300, 900),
+                      inputs=[("clip", "CLIP"), ("text", "STRING", "text")],
+                      outputs=[("CONDITIONING", "CONDITIONING")], widgets=[""], title="Flux positive")
+    G.link(flux["clip"], "CLIP", flux_pos, "clip", "CLIP")
+    G.link(pos_str, "STRING", flux_pos, "text", "STRING")
+    fg = G.node("FluxGuidance", (-300, 1020), inputs=[("conditioning", "CONDITIONING")],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[C_FF["guidance"]])
+    G.link(flux_pos, "CONDITIONING", fg, "conditioning", "CONDITIONING")
+    flux_neg = G.node("CLIPTextEncode", (-300, 1140),
+                      inputs=[("clip", "CLIP"), ("text", "STRING", "text")],
+                      outputs=[("CONDITIONING", "CONDITIONING")], widgets=[""], title="Flux negative")
+    G.link(flux["clip"], "CLIP", flux_neg, "clip", "CLIP")
+    G.link(neg_str, "STRING", flux_neg, "text", "STRING")
+    inp4 = G.node("InpaintModelConditioning", (-300, 1280),
+                  inputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING"),
+                          ("vae", "VAE"), ("pixels", "IMAGE"), ("mask", "MASK")],
+                  outputs=[("positive", "CONDITIONING"), ("negative", "CONDITIONING"),
+                           ("latent", "LATENT")], widgets=[False])
+    G.link(fg, "CONDITIONING", inp4, "positive", "CONDITIONING")
+    G.link(flux_neg, "CONDITIONING", inp4, "negative", "CONDITIONING")
+    G.link(flux["vae"], "VAE", inp4, "vae", "VAE")
+    G.link(restore, "IMAGE", inp4, "pixels", "IMAGE")
+    G.link(grow, "MASK", inp4, "mask", "MASK")
+    ks4 = G.node("KSampler", (20, 1280),
+                 inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
+                         ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
+                 outputs=[("LATENT", "LATENT")],
+                 widgets=[SEED, "randomize", C_FF["steps"], C_FF["cfg"], "euler", "normal", 0.35],
+                 title="Flux repaint (denoise 0.35)", tunable=True)
+    G.link(flux["unet"], "MODEL", ks4, "model", "MODEL")
+    G.link(inp4, "positive", ks4, "positive", "CONDITIONING")
+    G.link(inp4, "negative", ks4, "negative", "CONDITIONING")
+    G.link(inp4, "latent", ks4, "latent_image", "LATENT")
+    flux_dec = G.node("VAEDecode", (20, 1440), inputs=[("samples", "LATENT"), ("vae", "VAE")],
+                      outputs=[("IMAGE", "IMAGE")], title="Flux repainted")
+    G.link(ks4, "LATENT", flux_dec, "samples", "LATENT")
+    G.link(flux["vae"], "VAE", flux_dec, "vae", "VAE")
+
+    # ---- Stage 5: crop to 1080p (canvas is 1920x1088; shave 4px top/bottom -> 1920x1080)
+    # and save. No 4x upscale -- canvas is already full output res (upscale was for the old
+    # sub-1080p working size; at full res it's redundant).
+    final = crop_to_1080(G, tw, th, flux_dec, "IMAGE", (340, 1500))
+    save = G.node("SaveImage", (560, 1500), inputs=[("images", "IMAGE")],
+                  widgets=["SDXL_Flux_Outpaint_1080p"], title="save filename", tunable=True)
+    G.link(final, "IMAGE", save, "images", "IMAGE")
+    preview = G.node("PreviewImage", (560, 1620), inputs=[("images", "IMAGE")], title="preview")
+    G.link(final, "IMAGE", preview, "images", "IMAGE")
+
+    # LoadImage stays external (preview/mask-editor); it fans to gis + fit. Proxied onto the
+    # box: prompt pair, canvas width/height, SDXL checkpoint, controlnet, Flux repaint
+    # denoise, save filename.
+    proxy_order = [pos_str, neg_str, tw, th, ckpt, cn_load, ks4, save]
+    wires = [("IMAGE", gis, "image"), ("IMAGE", fit, "image")]
+    sg = emit_subgraph_with_image_seed(G, "SDXL-Flux Outpaint", proxy_order, img, wires)
+    dump_subgraph(sg, "SDXL-Flux-Outpaint-1080p")
 
 
 def main():
     build_ideogram()
     build_inpaint()
     build_outpaint()
+    build_sdxl_flux_outpaint()
     build_video()
 
 

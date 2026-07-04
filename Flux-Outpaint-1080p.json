@@ -256,7 +256,7 @@
      },
      {
       "id": 3,
-      "type": "UNETLoader",
+      "type": "UNETLoaderMultiGPU",
       "pos": [
        -1500,
        0
@@ -280,16 +280,17 @@
        }
       ],
       "properties": {
-       "Node name for S&R": "UNETLoader"
+       "Node name for S&R": "UNETLoaderMultiGPU"
       },
       "widgets_values": [
        "flux1-fill-dev.safetensors",
-       "fp8_e4m3fn"
+       "fp8_e4m3fn",
+       "cuda:2"
       ]
      },
      {
       "id": 4,
-      "type": "DualCLIPLoader",
+      "type": "DualCLIPLoaderMultiGPU",
       "pos": [
        -1500,
        180
@@ -314,17 +315,18 @@
        }
       ],
       "properties": {
-       "Node name for S&R": "DualCLIPLoader"
+       "Node name for S&R": "DualCLIPLoaderMultiGPU"
       },
       "widgets_values": [
        "clip_l.safetensors",
        "t5xxl_fp16.safetensors",
-       "flux"
+       "flux",
+       "cuda:2"
       ]
      },
      {
       "id": 5,
-      "type": "VAELoader",
+      "type": "VAELoaderMultiGPU",
       "pos": [
        -1500,
        360
@@ -349,10 +351,11 @@
        }
       ],
       "properties": {
-       "Node name for S&R": "VAELoader"
+       "Node name for S&R": "VAELoaderMultiGPU"
       },
       "widgets_values": [
-       "ae.safetensors"
+       "ae.safetensors",
+       "cuda:2"
       ]
      },
      {

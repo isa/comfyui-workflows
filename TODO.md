@@ -622,3 +622,477 @@ KSampler widgets_values[1] == "randomize", Inpaint's == "fixed" (unchanged). Adv
 to also make the prompt more explicit about desired background content and to expect
 some retries are normal for large-ratio outpaints -- this is inherent to how diffusion
 outpainting works, not something the workflow JSON alone can fully solve.
+
+### DONE (2026-07-02): pinned each workflow's loaders to a dedicated GPU (4x A100)
+User: GPUs mostly idle, each task spends a lot of time swapping models in/out of memory
+-- wants the 4x A100 40GB actually leveraged. Researched (not guessed) what's actually
+possible:
+- Confirmed via ComfyUI core source (gh api) that vanilla UNETLoader/VAELoader/
+  CheckpointLoaderSimple have NO device parameter at all, and CLIPLoader/DualCLIPLoader's
+  only options are ["default","cpu"] -- no way to pin a specific cuda:N without an
+  extension.
+- Confirmed a fundamental ComfyUI constraint: one queued workflow's nodes execute
+  sequentially regardless of device -- pinning models to different GPUs does NOT make a
+  SINGLE generation's internal steps run concurrently. What it does: eliminates the
+  swap-in/out cost (models stay resident on their own GPU instead of competing for one
+  shared device) and lets DIFFERENT workflows run truly concurrently without VRAM
+  contention.
+- User confirmed ComfyUI-MultiGPU (pollockjj/city96 lineage) is installed. Verified its
+  ACTUAL node registrations via `gh api` on the real repo (not memory/guessing):
+  `UNETLoaderMultiGPU`, `VAELoaderMultiGPU`, `CLIPLoaderMultiGPU`,
+  `DualCLIPLoaderMultiGPU`, `CheckpointLoaderSimpleMultiGPU` all genuinely exist, each
+  adding a trailing "device" widget (cuda:0/1/2/3/cpu) onto the vanilla loader's
+  widgets_values. Confirmed there is NO "auto" device option -- explicit assignment only.
+  Also confirmed a real coverage gap: the pack does NOT wrap LTXVAudioVAELoader,
+  LatentUpscaleModelLoader, or LTXAVTextEncoderLoader (LTX-2.3-specific loaders newer than
+  that pack's LTX integration, which only wraps the older single "LTXVLoader").
+
+Implementation: added GPU_IMAGEGEN="cuda:0", GPU_INPAINT="cuda:1", GPU_OUTPAINT="cuda:2",
+GPU_VIDEO="cuda:3" constants. `flux_fill_loaders()` now takes a `device` param, swapping
+in `*MultiGPU` node types + appending the device widget when set (shared by Inpaint/
+Outpaint, called with different GPUs each). Ideogram's 4 loaders (2x UNETLoader,
+CLIPLoader, VAELoader) all pinned to cuda:0. Video's `CheckpointLoaderSimple` (the ~22B
+param main LTX checkpoint, the single largest/most impactful piece) pinned to cuda:3; its
+3 auxiliary loaders left on vanilla types (no wrapped equivalent available) with a comment
+documenting why -- NOT silently glossed over.
+
+Verified: all 4 regenerate clean (`subgraph lint OK`), JSON valid, no `"widget": null`,
+and confirmed via direct JSON inspection that each workflow's loaders carry the correct
+`*MultiGPU` type + device widget (ImageGen->cuda:0 x4, Inpaint->cuda:1 x3, Outpaint->
+cuda:2 x3, Video's checkpoint->cuda:3 x1). Structural-only verification -- not yet tested
+against the live ComfyUI-MultiGPU install (need to confirm the pack's node types actually
+match what the user has installed, since versions can drift).
+
+### DIAGNOSED + FIXED (2026-07-02): video not respecting first/last keyframe at all
+User: video generation not respecting first/mid/last frame images "at all". Given LIVE
+tunnel access this turn (https://serious-lake-night-starring.trycloudflare.com), did a
+full live diagnosis instead of guessing:
+- Fetched the server's actual saved LTX-2.3-Video-Gen-1080p.json and traced the FULL
+  wiring by hand: top-level links (3 external LoadImage -> box instance sockets),
+  exposed subgraph inputs (linkIds fanning to 2 internal guides each), and each
+  LTXVAddGuide's own "image" input link -- ALL confirmed 100% correctly wired end to end.
+  (One false alarm along the way: an earlier inspection script mis-reported links as
+  "None" because it looked up origin_id=-10 -- the external-boundary marker -- in a dict
+  that only contains internal nodes; that's expected/correct, not a bug.)
+- Confirmed toggle states matched expectations (first=True, mid=False, last=True) and,
+  after asking, user confirmed real photos WERE uploaded (not stuck on the "example.png"
+  default placeholder, which I'd initially found still selected in the saved file and
+  had to rule out).
+- Verified `LTXVAddGuide` is actually a CORE ComfyUI node (comfy_extras/nodes_lt.py, not
+  the Lightricks pack) whose `.encode()` internally calls `comfy.utils.common_upscale(...,
+  crop="center")` -- confirms arbitrary source image resolutions are auto-resized/cropped
+  internally, ruling out a resolution-mismatch theory.
+- Root cause: guide `strength` too low to visibly enforce keyframe adherence. Confirmed
+  via the core node's own schema that `strength` supports up to 10.0 (not just 0-1), and
+  this project's own prior documentation (README, written before this exact issue) already
+  flagged: "At distilled CFG≈1 the mask is the sole keyframe enforcer -- raise strength
+  to lock a frame." Our inherited defaults (first 0.95/1.0, last 0.75/0.8) were
+  conservative relative to that headroom.
+
+Fix: raised first to (1.6, 2.0) and last to (1.4, 1.8) [stage1, stage2] as local overrides
+in build_extracted_workflows.py (NOT touching build_workflow.py's shared CONFIG, to avoid
+side effects on the original 3-meta pipeline). Registered
+`WIDGET_KEY["LTXVAddGuide"]="strength"` and proxied stage2's guide strength for first and
+last onto the collapsed box (mid left unexposed/unchanged, it's off by default and wasn't
+the reported issue). User declined removing the mid-frame lane ("wiring checks out, leave
+it"). Verified via JSON inspection: correct strength values landed, correctly proxied.
+`subgraph lint OK`, JSON valid. Not yet re-tested live -- next step is for user to re-run
+and confirm keyframes are now visibly respected; if still not enough, the new proxied
+strength controls let them push higher (up to 10.0) without regenerating.
+
+### FIXED (2026-07-02): example.png placeholder used as real keyframe; toggles hard to find
+User: "the model is not ignoring frames where the image is example.png" + "even with
+toggle on, example.png should be ignored" + "bring toggles to the main graphs in all
+graphs" (couldn't find the toggle inside the collapsed box).
+
+Investigated whether "skip if image is still the default placeholder" is buildable:
+confirmed (via gh api on ComfyUI core) that `LoadImage` has NO string output exposing its
+selected filename -- nothing to compare against a "is this still example.png" check from
+inside the graph. Content-based pixel-diffing was considered and rejected: fragile (a
+legitimately-768x768 real photo would false-positive as "unchanged"), and disproportionate
+complexity (would need a hardcoded reference LoadImage + resize-to-common-size + diff +
+threshold chain) for uncertain benefit.
+
+Practical fix instead: (1) moved the gen ON/OFF toggles (video: first/mid/last;
+image-gen: use-image-seed) OUT of the collapsed box entirely -- now REAL external
+PrimitiveBoolean nodes sitting in the main canvas right next to their paired LoadImage,
+so mismatches (toggle on, image still unset) are visually obvious rather than hidden
+inside a box; (2) changed video's first/last toggle DEFAULTS from True to False (mid was
+already False) -- a completely untouched workflow now does pure text-to-video, nothing
+happens unless the user deliberately opts in, which is the point where they'd also be
+expected to set a real image.
+
+Implementation:
+- `_guide_stage()` no longer takes a `toggles` param or wires the switch "switch" input
+  internally -- now returns `{name: (swp,swn,swl)}` per lane so the caller wires each
+  external toggle to all 6 of its switch consumers (3 switches x 2 stages).
+- `build_video()`: t_first/t_mid/t_last moved into the SAME shared throwaway `Graph()` as
+  the LoadImage nodes (unique sequential ids 1-6), added to `ext_nodes` and `wires`
+  alongside the images. `frames` dict's unused 5th "gen" tuple element hardcoded to False
+  for first/last (dead value regardless, real gating is via the external wire now).
+- `build_ideogram()`: `ref_img` + `toggle` moved to a shared throwaway `EG_ref = Graph()`,
+  externalized the same way (this closes a gap flagged-but-deferred in the earlier
+  mask-editor fix session, since the user now explicitly asked for "all graphs").
+- Deleted `emit_single_subgraph()` (now fully dead code -- every workflow has at least one
+  real external node these days). Left the singular `emit_subgraph_with_image_seed()`
+  (Inpaint/Outpaint, already live-confirmed working) untouched to avoid unnecessary risk.
+
+Verified via JSON inspection: Ideogram now 3 top nodes (LoadImage id1, Boolean id2, box
+id9001); Video now 7 top nodes (3x LoadImage + 3x Boolean interleaved ids 1-6, box 9001);
+all unique ids, no widget:null. Each toggle's exposed socket has exactly 6 internal
+linkIds (matches 3 switches x 2 stages); each image's socket has 2 (stage1+stage2 guide).
+proxyWidgets on the video box now shows only: prompts, first/last keyframe strength,
+duration, width, height, fps -- no toggles or images. All 4 regenerate clean
+(`subgraph lint OK`), JSON valid. Not yet re-tested live.
+
+### FIXED (2026-07-02): tail-end camera-cut/color-flicker artifact -- likely root cause found
+User reported a hard camera cut + color/tonality flicker near the last ~10% of generated
+video duration, "not the case before." Diagnosed live via a NEW tunnel
+(https://pipes-river-idaho-pop.trycloudflare.com):
+- Fetched actual execution history + submitted prompt: confirmed `first` toggle=True (real
+  photo "Army Marching 2.png", strength 1.6/2.0), `mid`/`last` toggle=False (still on
+  example.png placeholder) -- exactly as intended.
+- Downloaded the actual output video via /view, extracted frames around the last 2 seconds,
+  built contact sheets, and visually pinpointed the artifact: a hard cut from a wide shot to
+  a close-up with a visible color/exposure shift, landing at ~t=6.6-6.7s of a 7.0s/161-frame
+  clip -- suspiciously close to where frame_idx=-1 ("last") would target despite that lane
+  being toggled off.
+- User then pointed to their OWN separate, previously-working reference workflow
+  (`~/Dropbox/.../LTS-2.3-1080p.json`, aka the project's known "LTS-2.3-1080p.json"). Read
+  it in full and diff'd its architecture against ours:
+  - Its "first frame" uses `LTXVImgToVideoInplace` (different core node, strength capped
+    0-1.0, native `bypass` boolean input) instead of our `LTXVAddGuide`+`ComfySwitchNode`.
+  - Its "mid"/"last" use real `LTXVAddGuide` nodes (confirmed live via /object_info, same
+    node type we use) but disabled via ComfyUI's NATIVE per-node bypass mode
+    (`"mode":4` in the JSON -- structurally excludes the node from execution entirely,
+    zero ambiguity) rather than a runtime boolean routed through a switch.
+  - Uses `LTXVCropGuides` (confirmed live via /object_info: inputs positive/negative/latent
+    -> same types out) -- inserted between stage1's `LTXVSeparateAVLatent` output and
+    reuse downstream, to strip stale keyframe-guide metadata/padding before the latent is
+    reused. WE NEVER CALL THIS NODE AT ALL.
+  - User clarified: their reference has ONLY been confirmed clean for "first" (via
+    LTXVImgToVideoInplace) -- they have NOT yet tested whether ITS mid/last (bypass-mode)
+    path is actually artifact-free either, so this is not fully proven, just the strongest
+    available lead.
+- Asked user to choose between (a) minimal fix: add LTXVCropGuides, keep our current
+  runtime-toggle design, or (b) full architecture rework matching the reference (native
+  bypass mode for mid/last, losing the "flip a value" convenience they explicitly asked
+  for last time). User chose (a), citing the reference's mid/last path is unverified.
+
+Fix: added `LTXVCropGuides` node in `build_video()`, inserted between `sep1`
+(`LTXVSeparateAVLatent`, stage1's output) and the `LTXVLatentUpsampler` -- takes
+`s1_pos`/`s1_neg` (stage1's final guide-chain conditioning) + `sep1`'s video_latent,
+outputs a cropped latent that now feeds the upscaler (was previously fed directly by
+`sep1`'s raw output). Conditioning outputs are unused (we don't otherwise reuse stage1's
+conditioning; stage2 independently rebuilds its own guides from `cond`), which is fine.
+Verified via JSON inspection: crop_guides correctly sits between stage1's switch outputs +
+separated latent and the upsampler, `subgraph lint OK`, JSON valid. NOT YET RE-TESTED
+LIVE -- this is our best evidence-backed lead, not a confirmed fix; user needs to re-run
+at the same duration/strength settings and confirm the artifact is gone.
+
+### FIXED (2026-07-02): tail-end artifact -- switched first-frame conditioning to match official pattern
+LTXVCropGuides didn't help (user confirmed). User asked to check latest docs/best-practice
+GitHub workflows. Research findings (all verified live, not guessed):
+
+- **Comfy-Org/ComfyUI#12832** "LTXVAddGuide node last 1 second very bad" (open, unresolved)
+  is an EXACT match: "LTX2.3, new workflow, 24fps, 121 frames, first and last frame as 0
+  -1 index" -- literally our setup. This is a KNOWN, documented bug in LTXVAddGuide
+  itself when using first(0)+last(-1) frame_idx together.
+- PR #13793 (merged 2026-05-08): LTXVImgToVideoInplace was mutating input latents in
+  place and wiping the noise_mask LTXVAddGuide depends on -- confirms this whole node
+  family has had real, recent, in-place-mutation bugs.
+- PR #13882 (merged 2026-05-27, likely already in the user's ComfyUI 0.26.0 released
+  2026-06-24): LTXVCropGuides itself was undercounting guide frames sharing a start
+  position, leaving a stray latent frame that "decodes as a visible artifact at the end" --
+  explains why our earlier CropGuides addition didn't help (the bug it would have
+  addressed is probably already fixed upstream; our failure mode is different).
+- Fetched Lightricks' OWN official example workflow
+  (example_workflows/2.3/LTX-2.3_T2V_I2V_Two_Stage_Distilled.json from
+  Lightricks/ComfyUI-LTXVideo) and read its FULL wiring: it does NOT use LTXVAddGuide for
+  first-frame conditioning at all. It uses `LTXVImgToVideoConditionOnly` (noise-mask
+  based, strength capped 0-1.0, description: "Applies image conditioning to the first
+  frames... Creates a noise mask") with a `bypass` boolean (defaults True/bypassed --
+  confirms our "toggles off by default" decision was right). Preprocessing:
+  LoadImage -> ResizeImageMaskNode("scale longer dimension", 1536, "lanczos") -> (fans to
+  2 consumers) -> stage1 via LTXVPreprocess(img_compression=18), stage2 direct (no
+  preprocess). Strengths: stage1=0.7, stage2=1.0.
+- `LTXVImgToVideoConditionOnly` is documented as first-frames-only -- no official
+  alternative exists for last-frame anchoring, so mid/last necessarily keep using
+  LTXVAddGuide (accepting the #12832 risk there; asked user, they approved this
+  tradeoff explicitly over a full rework).
+
+Implementation:
+- `_guide_stage()` now loops over ("mid","last") only (was "first","mid","last"); added a
+  3rd lat_slot branch for LTXVImgToVideoConditionOnly's output name ("latent", lowercase --
+  confirmed via /object_info, DIFFERENT from EmptyLTXVLatentVideo/LTXVLatentUpsampler's
+  "LATENT" uppercase -- would have been a silent KeyError/wrong-slot bug if missed).
+- Registered `WIDGET_KEY["LTXVImgToVideoConditionOnly"]="strength"`.
+- Added `resize_first` (ResizeImageMaskNode) + `preprocess_first` (LTXVPreprocess) +
+  `not_first` (ComfyNotNode, inverts our "use first frame ON/OFF" toggle into the
+  `bypass` boolean ImgToVideoConditionOnly expects -- opposite semantics) + two
+  `LTXVImgToVideoConditionOnly` instances (stage1 strength=0.7 image=preprocessed,
+  stage2 strength=1.0 image=resize's direct output, no preprocess) replacing the old
+  "first" lane's LTXVAddGuide+switches entirely. Their LATENT output becomes the new
+  base_lat fed into `_guide_stage` for mid/last (replacing vid_lat/up directly).
+- Local STRENGTH_FIRST_S1/S2 = 0.7/1.0 (official defaults, NOT our earlier "raised"
+  0-10-range values which don't apply to this 0-1-capped node).
+- Updated proxy_order: replaced `s2_guides["first"]` with `cond_first_s2` (its own
+  "strength" widget). Updated wires: first_img -> resize_first.input, t_first ->
+  not_first.value (single links each, down from fanning to 2 guides / 6 switches).
+- Kept the LTXVCropGuides addition from the previous attempt (still defensively
+  reasonable for mid/last's guide metadata, doesn't hurt).
+
+Verified via JSON inspection: exactly 4 LTXVAddGuide instances now (mid+last x 2 stages,
+was 6), exactly 2 LTXVImgToVideoConditionOnly instances with correct widgets/wiring
+(vae/image/latent/bypass all correctly sourced), resize/preprocess widgets match the
+official template exactly, first's exposed sockets now carry 1 linkId each (was
+2 image-consumers / 6 switch-consumers), mid/last unchanged. All 4 regenerate clean,
+`subgraph lint OK`, JSON valid, no `"widget": null`. NOT YET RE-TESTED LIVE -- this is
+the most evidence-backed fix yet (matches upstream's own proven template exactly for the
+lane that was actually failing), but confirmation requires the user to re-run.
+
+### DONE (2026-07-02): grouped each keyframe's LoadImage+toggle pair visually
+User asked to "combine all these separate node parameters into a single one, so that I
+have only 3 input nodes to the video subgraph" (6 external nodes: 3x LoadImage + 3x
+PrimitiveBoolean toggle). Investigated whether a literal single-node merge is possible:
+
+- Searched the full live `/object_info` dump (1202 node types) for any node combining an
+  IMAGE output with a BOOLEAN toggle input -- none exists (KJNodes' image nodes are
+  folder/batch loaders, not single-image+toggle).
+- Nesting LoadImage inside a smaller per-lane subgraph was ruled out: it would regress
+  the mask-editor fix (proxied LoadImage loses its preview thumbnail + right-click "Open
+  in MaskEditor" for already-uploaded files -- the whole reason LoadImage was made
+  external in the first place, see the toggle-visibility gotcha above).
+- Asked the user to choose between (a) native per-node bypass mode (drop the toggle node
+  entirely, Ctrl+B to disable -- what their own reference workflow does for mid/last) or
+  (b) keep the 6 nodes + widgets but visually group each pair. **User picked (b),
+  visual grouping only** -- explicitly kept the runtime-clickable toggle widgets as-is.
+
+Implementation: added `_group_dict()` + a `groups` param to
+`emit_subgraph_with_image_seeds()`. Group JSON schema (`{id, title, bounding:[x,y,w,h],
+color, font_size, flags, nodes:[ids]}`) verified live against Lightricks' own
+`example_workflows/2.3/LTX-2.3_T2V_I2V_Two_Stage_Distilled.json` (not guessed --
+memory's old citation for this schema checked out correct). Bounding boxes are computed
+automatically from each ext_dict's actual pos/size, not hardcoded. Applied to
+`build_video()` (3 groups: "First Frame", "Mid Frame", "Last Frame") and, for
+consistency, `build_ideogram()`'s single ref-image+toggle pair ("Reference Image") --
+Inpaint/Outpaint don't need this, they only have a single external LoadImage each (no
+paired toggle). All 4 regenerate clean, `subgraph lint OK`, groups arrays verified by
+direct JSON inspection.
+
+### REVERTED (2026-07-03): visual Groups don't render for the user -> built a custom node instead
+User reported the visual Group frames from the previous change weren't showing at all
+(fresh load, still the same separate-nodes view) and asked again to "make both image and
+toggle in the same node." Root cause of the group failure couldn't be debugged live
+(remote server, only tunnel access) and the group JSON schema was verified correct, so
+rather than keep chasing a flaky frontend-rendering issue, abandoned the grouping
+approach entirely (removed `_group_dict()` + the `groups` param from
+`emit_subgraph_with_image_seeds`; `GROUP_COLOR` constant left as a harmless unused stub).
+
+Verified (not guessed) that the only literal way to combine an image picker + boolean
+toggle into ONE node is a small custom node: searched the full live `/object_info` (1202
+types) for any node with an `image_upload`-metadata widget AND a boolean widget -> none
+exists, not even in KJNodes. Confirmed the upload button / preview thumbnail / mask-editor
+UI attach to the `{"image_upload": True}` WIDGET METADATA, not the `LoadImage` node type
+-- `PainterNode` (comfy_extras/nodes_painter.py) is a non-LoadImage node using the same
+metadata and gets the full UI, which is the proof a custom node inherits it (no
+mask-editor regression). Also confirmed the exact metadata key is `image_upload` (with
+underscore), matching core `LoadImage` at nodes.py:1727.
+
+Implementation: added `generator/custom_nodes/ltx23_helpers/__init__.py` defining
+`LoadImageWithEnable` (mirrors `LoadImage.INPUT_TYPES` exactly + an `enable` BOOLEAN
+widget defaulting False; RETURN_TYPES `IMAGE, MASK, BOOLEAN`; delegates decode to core
+`LoadImage().load_image` so it stays robust to upstream changes). Registered
+`WIDGET_KEY["LoadImageWithEnable"]="enable"`. Rewrote `build_video()`'s 6-node block
+(3x LoadImage + 3x PrimitiveBoolean) into 3x `LoadImageWithEnable` (first/mid/last), and
+`build_ideogram()`'s ref pair into 1x `LoadImageWithEnable`. Wiring: each node's IMAGE
+output fans to the same guide/resize consumers as before, its ENABLE output fans to the
+same Switch consumers the separate toggle used to (first frame: ENABLE -> not_first
+inverter -> bypass; mid/last: ENABLE -> 6 switches each). Exposure keying by
+(node.id, output_name) gives each node distinct IMAGE vs ENABLE sockets. Improved socket
+labels: non-IMAGE outputs get " · enable" suffix so a lane's two sockets read distinctly.
+Inpaint/Outpaint UNCHANGED (plain `LoadImage`, no toggle, mask editor matters there).
+
+Verified by direct JSON inspection: Video Gen now 4 top nodes (3 lanes + box, was 7);
+Ideogram 2 (1 lane + box, was 3); internal fan-out per socket identical to before (first
+IMAGE->1/ENABLE->1, mid/last IMAGE->2/ENABLE->6); socket labels distinct ("first frame"
+/ "first frame · enable"). All 4 regenerate clean, `subgraph lint OK`, no `widget: null`,
+custom node py_compiles. **CAVEAT: Ideogram + Video now REQUIRE installing the
+`ltx23_helpers` pack (copy `generator/custom_nodes/ltx23_helpers/` into ComfyUI
+`custom_nodes/` + restart) -- without it they'll show a "missing node" error.** README
+Requirements + extracted-workflows notes updated to flag this. Not yet re-tested live.
+
+### FIXED (2026-07-03): mid/last keyframes applied despite being toggled OFF
+User reported the live video workflow took mid/last keyframes into effect even though
+they were toggled off -- only the first frame should apply. Diagnosed against the live
+tunnel (ComfyUI 0.26.0, custom node confirmed registered, outputs IMAGE/MASK/ENABLE):
+
+- The SWITCH wiring is correct: all 12 ComfySwitchNode `switch` inputs trace to the lane
+  node's ENABLE output (`['2',2]` for mid, `['3',2]` for last -- slot 2 = ENABLE). on_true
+  = guide applied, on_false = pre-guide conditioning. switch is lazy. Logic sound.
+- Root cause was the WIDGET VALUE ORDER, not the wiring. Pulled the actual saved widget
+  values from the embedded workflow in /history: node 1 (user-configured via UI) =
+  `['First Contact.png', True, False]`; nodes 2 & 3 (untouched generator defaults) =
+  `['example.png', 'image', False]`. The real LoadImageWithEnable widget order is
+  **[image, enable, upload]** (the auto-added `upload` widget is appended AFTER the
+  declared widgets, not right after `image` like in plain LoadImage). My generator emitted
+  `["example.png", "image", False]`, so the upload string `"image"` landed on the `enable`
+  slot and coerced to truthy **True** -- silently forcing every lane ON. The checkbox
+  rendered "off" from a different value than the stray string, hence the user saw them off
+  while the executed prompt carried `enable: True` (confirmed in /history: nodes 2 & 3
+  both `enable: True`, image `example.png`).
+
+Fix: widgets_values are now `[filename, enable_bool, "image"]` (enable at index 1) for all
+LoadImageWithEnable nodes (video first/mid/last + ideogram ref), matching the frontend's
+own canonical order. Also reordered the declared `_li_inputs` to [image, enable, upload]
+for consistency. Verified in generated JSON: all 4 lanes now `wv=['example.png', False,
+'image']` (enable=False). All 4 workflows regenerate clean, `subgraph lint OK`.
+
+ACTION FOR USER: reload LTX-2.3-Video-Gen-1080p.json (and Ideogram) -- the currently-loaded
+graph on the server still carries the buggy widget values. After reload, mid/last stay off
+by default; re-pick the first-frame image + enable it. Not yet re-tested live post-fix.
+
+### FIXED (2026-07-03): last keyframe froze the tail for ~2s + 8 leaked frames
+User reported the last frame was "a still image for a few seconds" at the end. Diagnosed
+fully live against the tunnel (this run had first ON, mid OFF, last ON with Army Marching
+2.png, strength 1.4/1.8):
+
+- Downloaded the output MP4 (LTX23_VideoGen_1080p_00012_.mp4) and ffprobe'd it: 105 frames
+  / 4.375s, but the job was configured for 97 frames / 4.04s -> 8 extra frames (one latent
+  block) leaked into the output.
+- Per-frame motion analysis (mean abs diff between consecutive frames): frames 0-47 MOVING
+  (~2s), frames 48-96 STILL (2.04s freeze), frames 97-104 moving again (the 8 leaked).
+- Pixel-MSE comparison against the actual keyframe images proved the frozen content: frozen
+  frame 70 vs LAST keyframe MSE=290 (near-identical) vs FIRST keyframe MSE=8548 (unrelated);
+  leaked frame 104 vs last keyframe MSE=332, vs frozen frame 70 MSE=60.6. So the ENTIRE tail
+  (frames 48-104, ~2.4s) was the last keyframe held as a still.
+- object_info/LTXVAddGuide tooltip confirms the structural fragility: for 9+ frame videos
+  frame_idx must be divisible by 8 or it's ROUNDED DOWN, and negative = from end -- so the
+  last-frame guide's targeting is imprecise, compounding with the leaked padding.
+
+TWO distinct bugs, both from the last-frame LTXVAddGuide path (the #12832-buggy family we'd
+only half-fixed -- first frame was switched to ImgToVideoConditionOnly, last was left on
+LTXVAddGuide):
+1. FROZEN BACK-HALF: last-frame guide at strength 1.4/1.8 was far too high (node default is
+   1.0). At that level LTX's temporal attention bleeds the last-keyframe pull across the
+   whole back half of the latent; the model satisfies it by freezing on the keyframe.
+2. 8 LEAKED FRAMES: LTXVCropGuides ran only after STAGE1, not after stage2 -- so stage2's
+   last-frame guide padding leaked straight into the final decode (105 vs 97 frames).
+
+Fix:
+- Added a SECOND LTXVCropGuides (crop2) after stage2's LTXVSeparateAVLatent (sep2), feeding
+  the VAE decode -- mirrors the existing stage1 crop_guides. Verified: 2 LTXVCropGuides now,
+  vdec fed by crop2.
+- Lowered STRENGTH_LAST from (1.4, 1.8) to (1.0, 1.0) -- node default, "respected but not
+  frozen". stage2's value stays proxied on the box (s2_guides["last"]), so it's tunable per
+  run: raise if last keyframe doesn't stick, lower if tail freezes.
+All 4 regenerate clean, `subgraph lint OK`. ACTION FOR USER: reload the workflow + re-run;
+if the tail still freezes, drop the proxied stage2 last-frame strength below 1.0 (or turn
+the last frame off). Not yet re-tested live post-fix.
+
+### FIXED + DIAGNOSED (2026-07-03): identical videos on re-queue + slideshow (frozen ends)
+User reported: (1) 3 queued jobs produced the EXACT same video 3x, (2) first AND last frames
+are still/frozen, feels like a slideshow.
+
+(1) IDENTICAL VIDEOS: history showed all 3 jobs had byte-identical inputs (same images,
+strengths, and FIXED seed) and all returned the same cached file (..._00015_.mp4). ComfyUI
+caches identical prompts, and a fixed seed makes the output deterministic -- so re-queuing
+the unchanged workflow always returns the same video. Fix: both RandomNoise nodes (stage1 +
+stage2) changed from "fixed" to "randomize" -> each run now differs. (To reproduce a good
+one, switch back to "fixed" + paste the seed.)
+
+(2) SLIDESHOW: downloaded ..._00015_.mp4 (first ON, mid OFF, last ON, 7s duration) and ran
+per-frame motion analysis. Result: frames 0-25 (~1s) FROZEN on the first keyframe, frames
+26-82 (~2.4s) moving, frames 83-160 (~3.25s) FROZEN on the last keyframe. So only ~2.4s of
+a 7s video actually moves. Cross-checked the last-frame freeze against the earlier run:
+last @ strength 1.4/1.8 froze ~50% of the tail; last @ 1.0/1.0 froze ~48% -- i.e. the tail
+freeze is STRENGTH-INDEPENDENT, confirming it's the structural #12832 LTXVAddGuide last-
+position bug, not a tuning problem. Lowering strength will NOT help. RECOMMENDATION: for
+movie-like motion use FIRST-FRAME ONLY (turn last off) -- LTX-2.3's official template only
+supports first-frame cleanly; last-frame keyframing via LTXVAddGuide is the weak spot.
+
+CORRECTION to the previous entry: the 161 frames was NOT a leak -- it's exactly the user's
+7.0s duration ((7*24-1)//8*8+1 = 161). The earlier "crop2 caused a 161-frame disaster" was
+a misdiagnosis (I'd assumed 97 expected). crop2 is left reverted regardless -- its 8-frame
+benefit is negligible since the tail is frozen by the guide anyway. Seed randomize is the
+live fix; last-frame-off is the slideshow fix. Not yet re-tested live.
+
+### ADDED (2026-07-04): SDXL-Flux-Outpaint-1080p.json — 5-stage seamless outpaint (the YouTube flow)
+User: "our outpaint is not working at all" + shared a YouTube "Seamless Outpainting with Flux in
+ComfyUI" workflow and asked to implement that exact flow. Diagnosis first: ran a minimal Flux Fill
+outpaint live on the tunnel (LoadImage -> ImageScale -> ImagePadForOutpaint -> Flux Fill -> decode)
+and it SUCCEEDED (produced output). So Flux Fill isn't broken -- the single-pass outpaint's failure
+is QUALITY (seams, subject-duplication at large fills), which is exactly the problem the video's
+multi-stage flow solves (SDXL outpaints first because direct Flux outpaint is weak, then restore
+original details, then Flux repaints just the seam, then upscale).
+
+Verified the exact SDXL+ControlNet mechanics against xinsir's own ControlNetPlus/workflow/outpaint
+reference (canonical source for Union ProMax outpaint): the key node is SetUnionControlNetType set
+to "repaint", plus VAEEncodeForInpaint (grow_mask_by), ControlNetApplyAdvanced (image=control image,
+strength 1/0/1), then KSampler, VAEDecode, and ImageCompositeMasked to paste the original center
+back. Confirmed ALL required nodes already installed on the server (SetUnionControlNetType,
+VAEEncodeForInpaint, ControlNetApplyAdvanced, ImageCompositeMasked, InvertMask, MaskToImage,
+GrowMaskWithBlur, UpscaleModelLoader, ImageUpscaleWithModel, etc.). Only MODELS missing.
+
+Implementation: new build_sdxl_flux_outpaint() in build_extracted_workflows.py, added C_SDXL config
++ WIDGET_KEY for CheckpointLoaderSimple/ControlNetLoader/UpscaleModelLoader. 5 stages:
+  1. fit-scale + ImagePadForOutpaint (copied from build_outpaint) -> padded IMAGE + border MASK
+  2. SDXL CheckpointLoaderSimple + ControlNetLoader(promax) -> SetUnionControlNetType("repaint")
+     -> control-image prep (InvertMask->MaskToImage->ImageCompositeMasked) -> CLIPTextEncode ->
+     ControlNetApplyAdvanced -> VAEEncodeForInpaint(grow_mask_by=30) -> KSampler(25/4.5/dpmpp_2m/
+     karras) -> VAEDecode
+  3. ImageCompositeMasked(SDXL-outpainted, padded-original, center-mask) -> restore exact details
+  4. flux_fill_loaders (VANILLA -- no MultiGPU device, see bug below) + GrowMaskWithBlur +
+     InpaintModelConditioning + KSampler(denoise 0.35) -> VAEDecode
+  5. UpscaleModelLoader(4x) -> ImageUpscaleWithModel -> ImageScale(1920x1080) -> Save/Preview
+Shared prompt: ONE PrimitiveString pair links to all 4 CLIPTextEncode.text inputs (SDXL pos/neg +
+Flux pos/neg), so the user sets the outpaint prompt once. Proxied on the box: prompt pair, working
+w/h, SDXL checkpoint, controlnet, upscale model, Flux repaint denoise, save filename (9 widgets).
+
+Verified: regenerates clean, `subgraph lint OK`, 42 internal nodes + 1 external LoadImage, key
+widgets correct (repaint / 1.0,0.0,1.0 / grow_mask_by=30 / SDXL 25-4.5-dpmpp_2m-karras / Flux
+denoise 0.35), all 30 node types registered on the server (workflow loads with no missing-node
+errors). ACTION FOR USER: download the 3 models (SDXL checkpoint, ControlNet Union promax, 4x
+upscale), load the workflow, pick the models in the 3 pickers, set a prompt, run. SDXL-side
+correctness can't be live-tested until those models are present -- wiring taken verbatim from
+xinsir's proven reference to minimize that risk.
+
+Side finding (flagged, NOT fixed): flux_fill_loaders emits a `device` widget value on the
+*MultiGPU loader variants, but live object_info shows those nodes have NO `device` widget -- a
+spurious value (currently ignored, not crashing) in inpaint/outpaint/ideogram/video. The new
+SDXL-Flux outpaint uses VANILLA flux_fill_loaders (device=None) to avoid it. Trimming the
+`+ ([device] if device else [])` widget append in flux_fill_loaders is a follow-up.
+
+### FIXED (2026-07-04): SDXL-Flux outpaint "frame" artifact + wrong canvas size
+User ran SDXL-Flux-Outpaint (all 3 models downloaded: juggernautXL_v9, promax controlnet,
+4x-UltraSharp) on a PORTRAIT source (Ustad03.png 2136x2944) and got a visible "frame" -- the
+outpaint wasn't seamlessly extending left/right. Also: "I want 1920x1080 output" + "not sure
+where 1024x576 is coming from, I didn't set that."
+
+Diagnosis (live, against the actual output PNG):
+- 1024x576 was the DEFAULT canvas size I'd set in C_SDXL (SDXL-friendly). The portrait source
+  was fit-scaled to 418x576 (downscaled from 2944!), centered, leaving 303px left/right borders.
+- Per-frame analysis: sharp ~5px vertical edge at exactly the original's left/right boundaries
+  (x≈557 and x≈1358) = a hard seam at the original rectangle.
+- Region texture: left/right borders std~25 vs original center std~48 = the SDXL-generated
+  borders were FLATTER/less detailed than the original. So the "frame" = detailed original
+  rectangle surrounded by weak, flat generated content + a hard seam.
+- Root cause: SDXL generating at only 0.59MP (1024x576) under-fills large borders; combined with
+  the source downscaled to 576px (detail lost then upscaled), the borders came out flat.
+
+Fix:
+- Canvas now runs at full 1920x1088 (OUT_W/OUT_H) -- source stays at native detail, SDXL+Flux
+  get the resolution to extend well. Cropped to 1920x1080 via crop_to_1080 (Flux needs mult-of-16
+  latents, hence 1088 not 1080). Removed the 4x upscale stage entirely (was only needed for the
+  sub-1080p working size; at full res it's redundant). 4x-UltraSharp download now unused/optional.
+- Widened ImagePadForOutpaint feathering 40 -> 80 (at full res the 40px feather was proportionally
+  thin; 80px softens the original/generated boundary).
+- Caveat noted in the docstring: SDXL is trained near 1MP, so 2MP is above its sweet spot -- but
+  for outpaint (extending backgrounds, not full scenes) it's acceptable, and the Flux repaint pass
+  cleans up artifacts.
+- Removed WIDGET_KEY["UpscaleModelLoader"] + C_SDXL "upscale"/"work_w"/"work_h". proxy_order now
+  8 widgets (was 9). Verified: regenerates clean, lint OK, canvas 1920x1088, ImageCrop->1920x1080,
+  no upscale nodes. ACTION FOR USER: reload SDXL-Flux-Outpaint-1080p.json, re-run. The extreme
+  portrait->landscape aspect (60% newly generated width) is inherently hard -- a descriptive
+  prompt for the extended scene also helps; if borders still look weak, raise the proxied Flux
+  repaint denoise above 0.35 to regenerate them more aggressively.

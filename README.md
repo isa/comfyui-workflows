@@ -11,32 +11,43 @@ Four independent, single-purpose workflows. All save **exactly 1920×1080**: the
 at 1920×1088 (LTX/Flux need mult-of-64 latents) then an `ImageCrop` shaves 4px off the top
 and bottom before saving.
 
-All four are packaged as **one collapsed native subgraph box** each, plus — for
-Inpaint/Outpaint/Video — one or more real `LoadImage` nodes sitting right next to that box
-(see the mask-editor gotcha below for why those aren't hidden inside). Every other node
-(loaders, guider/sampler chain, VAE encode/decode, the 1080p crop, preview) lives hidden in
-the collapsed box, and a handful of widgets are surfaced on its outside, grouped sensibly:
+All four are packaged as **one collapsed native subgraph box** each, plus one or more real
+nodes sitting right next to that box in the main canvas — never hidden/proxied inside it
+(see the two gotchas below for why). Every other node (loaders, guider/sampler chain, VAE
+encode/decode, the 1080p crop, preview) lives hidden in the collapsed box, and a handful of
+widgets are surfaced on its outside, grouped sensibly:
 
 | File | Purpose | Exposed controls |
 |---|---|---|
-| `Ideogram-Image-Gen-1080p.json` | Text-to-image (Ideogram 4) | *on the collapsed box:* (positive, negative prompt) / (**image seed** + ON/OFF toggle — optional img2img reference) / (width, height) / (save filename) |
+| `Ideogram-Image-Gen-1080p.json` | Text-to-image (Ideogram 4) | one real **`LoadImageWithEnable`** node (custom — image picker + enable checkbox in one, optional img2img reference) next to the collapsed box, which exposes (positive, negative prompt) / (width, height, save filename) |
 | `Flux-Inpaint-1080p.json` | Inpaint a region of an image | a real **`LoadImage` node** (paint the mask directly on it, mandatory) next to the collapsed box, which exposes (positive, negative prompt) / (**denoise**, default 0.65) / (width, height, save filename) |
-| `Flux-Outpaint-1080p.json` | Extend an image's canvas (outpaint) | a real **`LoadImage` node** (mandatory, fit-scaled and centered — any size/aspect) next to the collapsed box, which exposes (positive, negative prompt) / (width, height, save filename) |
-| `LTX-2.3-Video-Gen-1080p.json` | Text/keyframe-to-video with audio | 3 real **`LoadImage` nodes** (first/mid/last frame seeds, each optional) next to the collapsed box, which exposes (positive, negative prompt) / (first/mid/last gen ON/OFF toggles) / (duration) / (width, height) / (fps); saves an MP4 via `SaveVideo` |
+| `Flux-Outpaint-1080p.json` | Extend an image's canvas (outpaint) — **single-pass Flux Fill, simple but can seam/hallucinate on large fills** | a real **`LoadImage` node** (mandatory, fit-scaled and centered — any size/aspect) next to the collapsed box, which exposes (positive, negative prompt) / (width, height, save filename) |
+| `SDXL-Flux-Outpaint-1080p.json` | **Seamless outpaint** — SDXL+ControlNet Union → restore original → Flux repaint (the recommended outpaint; needs 2 downloads) | a real **`LoadImage` node** next to the collapsed box, which exposes (positive, negative prompt) / (canvas width, height — default 1920×1088 → cropped to 1080p) / (SDXL checkpoint, ControlNet Union promax pickers) / (Flux repaint **denoise**, default 0.35) / (save filename) |
+| `LTX-2.3-Video-Gen-1080p.json` | Text/keyframe-to-video with audio | 3 real **`LoadImageWithEnable`** nodes (custom — image picker + enable checkbox in one; first/mid/last frame, each **off by default**) next to the collapsed box, which exposes (positive, negative prompt) / (**first/last keyframe strength**) / (duration) / (width, height) / (fps); saves an MP4 via `SaveVideo` |
 
 Notes:
 - **"Image seed"** = an input image, not an RNG seed. For image-gen it's an *optional*
   style/composition reference (toggle-gated — off = plain text-to-image); for
   inpaint/outpaint it's *mandatory* (the image you're editing, no toggle); for video it's
-  an optional keyframe per lane (also toggle-gated, one toggle per lane, proxied onto the
-  box alongside the prompts — the LoadImage nodes themselves stay external, same as
-  inpaint/outpaint, for the same mask-editor/preview reason).
-- **Why Inpaint/Outpaint's image seed isn't hidden inside the box:** a proxied widget only
-  mirrors a `LoadImage`'s plain filename dropdown — it doesn't carry over the preview
-  thumbnail + right-click "Open in MaskEditor" the frontend attaches to a real node
-  instance. That made the mask editor unreachable when picking an *already-uploaded* file
-  (only worked when uploading fresh). Keeping it as a genuine external node, wired into the
-  box through a real input socket, fixes that.
+  an optional keyframe per lane (also toggle-gated, one toggle per lane).
+- **Why the image nodes sit outside the box, not proxied:** a proxied `LoadImage` widget
+  only mirrors the plain filename dropdown — it doesn't carry over the preview thumbnail +
+  right-click "Open in MaskEditor" the frontend attaches to a real node instance, making
+  the mask editor unreachable for already-uploaded files. So every image stays a real,
+  top-level node. Video's first/last keyframe toggles also default to **OFF** — a
+  completely untouched workflow does plain text-to-video.
+- **`LoadImageWithEnable` (custom node) — one node = image + enable.** For Ideogram's
+  optional reference and Video's three keyframe lanes, the image picker and its on/off
+  toggle are bundled into a single custom node (`generator/custom_nodes/ltx23_helpers/`),
+  so Video Gen has exactly **3 input nodes** (not 6). No stock or installed ComfyUI node
+  combines an image picker with a boolean toggle (verified across every type a live server
+  reports), so a small custom node is the only literal single-node way. It mirrors core
+  `LoadImage` exactly — same `image_upload` widget metadata — so it inherits the upload
+  button, preview thumbnail, and mask editor (the UI attaches to that metadata, not to the
+  `LoadImage` type specifically; `PainterNode` uses the same trick). **Install required:**
+  copy/symlink `generator/custom_nodes/ltx23_helpers/` into your ComfyUI `custom_nodes/`
+  and restart, or these workflows will show a "missing node" error. (Inpaint/Outpaint keep
+  a plain `LoadImage` — no toggle, and the mask editor matters there.)
 - **Inpaint** scales the source to target resolution with aspect preserved (scale-to-cover
   + center-crop) — it will never stretch your image.
 - **Inpaint's `denoise` control (default 0.65):** at `denoise=1.0` the masked region enters
@@ -70,15 +81,46 @@ Notes:
   on, mid off (default) → first→last interpolation. `stage1 width/height` (LTX's internal
   half-resolution pass) is computed automatically as target/2, not a separate control —
   only ONE width/height pair is exposed.
+- **First frame uses a different, more robust mechanism than mid/last.** It's built on
+  `LTXVImgToVideoConditionOnly` (noise-mask based, strength capped 0–1.0, official default
+  0.7/1.0 [stage1/stage2]) with a preprocessing chain matching Lightricks' own official
+  reference template exactly (resize to 1536px longer edge → `LTXVPreprocess` for stage1,
+  direct for stage2). Mid/last use `LTXVAddGuide` instead (attention-based, strength up to
+  10.0, tunable for last via the proxied control) since there's no official
+  first-frame-style alternative for those positions. This split exists because of a known,
+  still-open upstream bug — [Comfy-Org/ComfyUI#12832](https://github.com/Comfy-Org/ComfyUI/issues/12832)
+  "LTXVAddGuide node last 1 second very bad" — that reproduced almost exactly with our
+  original all-`LTXVAddGuide` design (first=0, last=-1 frame_idx), causing a hard camera
+  cut + color shift near the end of longer clips. Using `LTXVAddGuide` only where it's
+  actually needed (mid/last) avoids the bug for the most commonly used lane (first);
+  mid/last still carry that upstream risk, since there's no current workaround for them.
+- Video also includes an `LTXVCropGuides` step between stage1 and the latent upscaler,
+  stripping stale keyframe-guide conditioning/padding before stage2 reuses that latent —
+  a defensive measure matching a known-good reference workflow, kept even though it wasn't
+  the actual fix for the artifact above.
+- **Each workflow's models are pinned to a dedicated GPU** (requires
+  [ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU)): ImageGen → `cuda:0`,
+  Inpaint → `cuda:1`, Outpaint → `cuda:2`, Video's main LTX checkpoint → `cuda:3`. This
+  does **not** make one generation's internal steps run concurrently — ComfyUI always
+  executes a queued workflow's nodes sequentially. What it does: each workflow's models
+  stay resident on their own GPU instead of competing for space on one shared device
+  (eliminating repeated evict/reload swap cost), and it lets you run *different* workflows
+  truly concurrently (e.g. queue an Inpaint and an Outpaint job at the same time) without
+  them fighting over the same VRAM. Known gap: ComfyUI-MultiGPU doesn't wrap Video's 3
+  auxiliary LTX-2.3 loaders (`LTXVAudioVAELoader`, `LatentUpscaleModelLoader`,
+  `LTXAVTextEncoderLoader`) — only its main checkpoint is pinned; those three stay on
+  whichever GPU is ComfyUI's default. To change the GPU assignments, edit
+  `GPU_IMAGEGEN`/`GPU_INPAINT`/`GPU_OUTPAINT`/`GPU_VIDEO` near the top of
+  `generator/build_extracted_workflows.py` and regenerate.
 - ImageGen/Inpaint/Outpaint's subgraph boxes each also have a hidden `PreviewImage` fed by
   the same 1080p-cropped output as `SaveImage`, so you get a live thumbnail without opening
   the box. Video has no equivalent preview node — `SaveVideo` is its only output.
 - Generator: `generator/build_extracted_workflows.py` (reuses the same `CONFIG`/node
-  framework as the pipeline generator below, plus its own `emit_single_subgraph()` for
-  ImageGen's fully-self-contained box, `emit_subgraph_with_image_seed()` for
-  Inpaint/Outpaint's box-plus-one-external-LoadImage layout, and
-  `emit_subgraph_with_image_seeds()` for Video's box-plus-three-external-LoadImage layout).
-  Edit `CONFIG` in `generator/build_workflow.py` and rerun
+  framework as the pipeline generator below, plus its own `emit_subgraph_with_image_seed()`
+  for Inpaint/Outpaint's box-plus-one-external-node layout and
+  `emit_subgraph_with_image_seeds()` (plural, generic — handles both `LoadImage` and
+  `PrimitiveBoolean` external nodes) for ImageGen's and Video's box-plus-multiple-external-
+  node layouts. Edit `CONFIG` in `generator/build_workflow.py` and rerun
   `python3 generator/build_extracted_workflows.py` to regenerate all four.
 - These are **structural-only verified** (schema lint + JSON validity) — load each in
   ComfyUI and confirm no red/error nodes before relying on it.
@@ -152,8 +194,19 @@ satisfy `(n−1) % 8 == 0`.
 ## Requirements
 
 **ComfyUI** (recent build — `ComfySwitchNode`, typed `PrimitiveInt/Float`, LTX-2.3 / Ideogram-4 /
-Flux-Fill nodes are built-in). **Custom nodes**: `ComfyUI-LTXVideo` (Lightricks); optionally
-`ComfyUI-VideoHelperSuite`, `ComfyUI-MultiGPU` + `ComfyUI-ParallelAnything` for the 4-GPU setup.
+Flux-Fill nodes are built-in). **Custom nodes**: `ComfyUI-LTXVideo` (Lightricks); the tiny
+`ltx23_helpers` pack bundled in this repo at `generator/custom_nodes/ltx23_helpers/` (provides
+`LoadImageWithEnable`, the combined image+enable node Ideogram/Video use — copy/symlink it into your
+ComfyUI `custom_nodes/` and restart); optionally `ComfyUI-VideoHelperSuite`, `ComfyUI-MultiGPU` +
+`ComfyUI-ParallelAnything` for the 4-GPU setup.
+
+**For `SDXL-Flux-Outpaint-1080p.json` only** — 2 extra models the server doesn't have by default
+(both exposed as pickers on the collapsed box, so pick the right file after downloading): an
+**SDXL checkpoint** → `models/checkpoints/` (e.g. `juggernautXL_v9.safetensors`); **ControlNet
+Union SDXL promax** → `models/controlnet/` (`diffusion_pytorch_model_promax.safetensors` from
+`huggingface.co/xinsir/ControlNet-Union-SDXL`). The Flux Fill repaint stage reuses `flux1-fill-dev`
++ `clip_l` + `t5xxl` + `ae` already on the server. (No upscale model needed — the canvas runs at
+full 1920×1088 directly.)
 
 **Models** (already downloaded; filenames in `CONFIG`): LTX — `ltx-2.3-22b-dev`,
 `ltx-2.3-22b-distilled-lora-384-1.1`, `ltx-2.3-spatial-upscaler-x2-1.1`, `comfy_gemma_3_12B_it`;
